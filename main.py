@@ -130,7 +130,7 @@ def expire_if_needed(kind, group_id):
 def flex_message(alt_text, contents):
     return FlexSendMessage(
         alt_text=alt_text,
-        contents=FlexContainer.from_dict(contents)
+        contents=contents
     )
 
 
