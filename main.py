@@ -164,7 +164,7 @@ def panel_message():
             "contents": [
                 {"type": "text", "text": "廠區緊急救護面板", "weight": "bold", "size": "lg"},
                 {"type": "text", "text": "發生緊急狀況時，請點選下方按鈕啟動救護通知。", "wrap": True, "size": "sm", "color": "#666666"},
-                {"type": "button", "style": "primary", "color": "#D93025", "height": "lg",
+                {"type": "button", "style": "primary", "color": "#D93025", "height": "md",
                  "action": postback("🚨 緊急救護", "action=start_emergency")}
             ]
         }
