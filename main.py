@@ -248,7 +248,6 @@ def incident_status_text(incident):
         "🔴【無法前往】",
         * (unavailable if unavailable else ["目前尚無人回報無法前往"]),
         "",
-        "※ 僅統計已完成回報的人員；尚未回報人數因無完整群組名冊，暫不計算。",
     ]
     return "\n".join(lines)
 
