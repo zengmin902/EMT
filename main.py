@@ -380,7 +380,9 @@ async def callback(request: Request):
                     pending_closures.pop(group_id, None)
                     reply_text(
                         event.reply_token,
-                        f"✅ 救護事件已結束。\n事件編號：{incident_id}\n事故地點：{incident['location']}\n"
+                        f"✅ 救護事件已結束。\n"
+                        f"事件編號：{incident_id}\n"
+                        f"事故地點：{incident['location']}"
                     )
 
             elif action == "cancel_close":
