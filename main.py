@@ -400,7 +400,7 @@ async def callback(request: Request):
         text = event.message.text.strip()
         user_id = get_user_id(event)
 
-        if text == "緊急面板":
+        if text == "119":
             line_bot_api.reply_message(event.reply_token, panel_message())
             continue
 
