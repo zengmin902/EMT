@@ -14,8 +14,6 @@ from linebot.models import (
     TextMessage,
     TextSendMessage,
     FlexSendMessage,
-    FlexContainer,
-    PostbackAction,
 )
 
 app = FastAPI()
@@ -28,14 +26,6 @@ CHANNEL_SECRET = os.environ.get("CHANNEL_SECRET", "")
 
 line_bot_api = LineBotApi(CHANNEL_ACCESS_TOKEN)
 parser = WebhookParser(CHANNEL_SECRET)
-
-# ============================================================
-# 指定救護人員名單
-# 請取得救護人員的 LINE User ID 後填入。
-# 尚未填入前採「拒絕計入」原則，避免非指定人員被列為有效回報。
-# 範例：RESCUE_USER_IDS = {"Uxxxxxxxxxxxxxxxx", "Uyyyyyyyyyyyyyyyy"}
-# ============================================================
-RESCUE_USER_IDS = set()
 
 TAIWAN_TZ = timezone(timedelta(hours=8))
 WAIT_SECONDS = 5 * 60
@@ -134,16 +124,6 @@ def flex_message(alt_text, contents):
     )
 
 
-def button(label, action, color="#1769AA"):
-    return {
-        "type": "button",
-        "style": "primary",
-        "color": color,
-        "height": "sm",
-        "action": action,
-    }
-
-
 def postback(label, data, display_text=None):
     return {
         "type": "postback",
@@ -211,7 +191,7 @@ def response_message(incident_id):
             "type": "box", "layout": "vertical", "spacing": "md",
             "contents": [
                 {"type": "text", "text": "救護人員回報", "weight": "bold", "size": "lg"},
-                {"type": "text", "text": "請指定救護人員依目前狀況選擇：", "wrap": True, "size": "sm"},
+                {"type": "text", "text": "請收到通知的群組成員依目前狀況選擇：", "wrap": True, "size": "sm"},
                 {"type": "button", "style": "primary", "color": "#16834A", "height": "md",
                  "action": postback("收到，可以前往", f"action=ack_available&incident_id={incident_id}")},
                 {"type": "button", "style": "primary", "color": "#B3261E", "height": "md",
@@ -240,44 +220,36 @@ def close_confirmation_message(incident_id, status_text):
     return flex_message("請確認是否結束救護事件", contents)
 
 
-def incident_status_text(group_id, incident):
-    roster_total = len(RESCUE_USER_IDS)
+def incident_status_text(incident):
+    """統計所有已回報群組成員；不依賴預先指定名單，也不推算未回報人數。"""
     available = []
     unavailable = []
-    not_responded = []
 
-    for user_id in RESCUE_USER_IDS:
-        record = incident["responses"].get(user_id)
-        name = get_display_name(group_id, user_id)
-        if not record:
-            not_responded.append(name)
-        elif record["status"] == "available":
-            available.append(name)
+    for record in incident["responses"].values():
+        name = record.get("display_name") or "群組成員"
+        entry = f"{name}｜{time_text(record['time'])}"
+        if record["status"] == "available":
+            available.append(entry)
         else:
-            unavailable.append(name)
+            unavailable.append(entry)
 
     responded_count = len(available) + len(unavailable)
     lines = [
-        "📋【救護人員回報狀況】",
+        "📋【緊急救護即時支援狀況】",
         f"事件編號：{incident['id']}",
         f"事故地點：{incident['location']}",
-        f"指定救護人員：{roster_total} 人",
-        f"已回報：{responded_count} 人",
+        f"已回報總人數：{responded_count} 人",
         f"可以前往：{len(available)} 人",
         f"無法前往：{len(unavailable)} 人",
-        f"尚未回報：{len(not_responded)} 人",
         "",
-        "【可以前往】",
-        "、".join(available) if available else "目前無",
+        "🟢【可以前往】",
+        * (available if available else ["目前尚無人回報可以前往"]),
         "",
-        "【無法前往】",
-        "、".join(unavailable) if unavailable else "目前無",
+        "🔴【無法前往】",
+        * (unavailable if unavailable else ["目前尚無人回報無法前往"]),
         "",
-        "【尚未回報】",
-        "、".join(not_responded) if not_responded else "目前無",
+        "※ 僅統計已完成回報的人員；尚未回報人數因無完整群組名冊，暫不計算。",
     ]
-    if roster_total == 0:
-        lines.extend(["", "⚠️ 尚未設定指定救護人員 LINE User ID，目前無法進行有效人員回報統計。"])
     return "\n".join(lines)
 
 
@@ -361,12 +333,17 @@ async def callback(request: Request):
                 incident = active_incidents.get(group_id)
                 if not incident or incident["id"] != incident_id:
                     reply_text(event.reply_token, "此救護事件已結束或通知已失效。")
-                elif user_id not in RESCUE_USER_IDS:
-                    reply_text(event.reply_token, "此帳號不在指定救護人員名單內，本次回報不列入有效統計。")
+                elif not user_id:
+                    reply_text(event.reply_token, "無法辨識回報帳號，請確認以個人 LINE 帳號操作。")
                 elif user_id in incident["responses"]:
                     old = incident["responses"][user_id]
                     old_status = "可以前往" if old["status"] == "available" else "無法前往"
-                    reply_text(event.reply_token, f"已收到你的回報，不重複更新紀錄。\n首次回報狀態：{old_status}\n首次回報時間：{time_text(old['time'])}")
+                    reply_text(
+                        event.reply_token,
+                        f"已收到你的回報，不重複更新紀錄。\n"
+                        f"首次回報狀態：{old_status}\n"
+                        f"首次回報時間：{time_text(old['time'])}"
+                    )
                 else:
                     status = "available" if action == "ack_available" else "unavailable"
                     display_name = get_display_name(group_id, user_id)
@@ -377,9 +354,20 @@ async def callback(request: Request):
                         "display_name": display_name,
                     }
                     status_label = "收到，可以前往" if status == "available" else "收到，但無法前往"
+                    # 同一則群組回覆同時確認個人回報，並公開更新所有人的支援名單與統計。
                     line_bot_api.reply_message(
                         event.reply_token,
-                        TextSendMessage(text=f"✅ 救護回報\n回報人員：{display_name}\n回報狀態：{status_label}\n首次回報時間：{time_text(timestamp)}")
+                        [
+                            TextSendMessage(
+                                text=(
+                                    f"✅ 救護回報已登記\n"
+                                    f"回報人員：{display_name}\n"
+                                    f"回報狀態：{status_label}\n"
+                                    f"首次回報時間：{time_text(timestamp)}"
+                                )
+                            ),
+                            TextSendMessage(text=incident_status_text(incident)),
+                        ]
                     )
 
             elif action == "confirm_close":
@@ -391,7 +379,10 @@ async def callback(request: Request):
                 else:
                     active_incidents.pop(group_id, None)
                     pending_closures.pop(group_id, None)
-                    reply_text(event.reply_token, f"✅ 救護事件已結束。\n事件編號：{incident_id}\n事故地點：{incident['location']}\n事件資料已從本次執行中的暫存狀態清除。")
+                    reply_text(
+                        event.reply_token,
+                        f"✅ 救護事件已結束。\n事件編號：{incident_id}\n事故地點：{incident['location']}\n事件資料已從本次執行中的暫存狀態清除。"
+                    )
 
             elif action == "cancel_close":
                 incident = active_incidents.get(group_id)
@@ -415,7 +406,7 @@ async def callback(request: Request):
         if text == "回報狀況":
             incident = active_incidents.get(group_id)
             if incident:
-                reply_text(event.reply_token, incident_status_text(group_id, incident))
+                reply_text(event.reply_token, incident_status_text(incident))
             else:
                 reply_text(event.reply_token, "目前沒有進行中的救護事件。")
             continue
@@ -427,7 +418,7 @@ async def callback(request: Request):
             elif user_id != incident["initiator"]:
                 reply_text(event.reply_token, "只有原始啟動人員可以提出結束救護事件。")
             else:
-                status = incident_status_text(group_id, incident)
+                status = incident_status_text(incident)
                 pending_closures[group_id] = {"incident_id": incident["id"], "initiator": user_id}
                 line_bot_api.reply_message(
                     event.reply_token,
@@ -463,7 +454,12 @@ async def callback(request: Request):
                 incident["location"] = text
                 line_bot_api.reply_message(
                     event.reply_token,
-                    TextSendMessage(text=f"📍【事故地點更正】\n原事故地點：{old_location}\n最新事故地點：{text}\n請所有救護人員以最新地點為準。")
+                    TextSendMessage(
+                        text=(
+                            f"📍【事故地點更正】\n原事故地點：{old_location}\n"
+                            f"最新事故地點：{text}\n請所有救護人員以最新地點為準。"
+                        )
+                    )
                 )
             else:
                 reply_text(event.reply_token, "原救護事件已不存在，本次地點修正未套用。")
@@ -495,7 +491,7 @@ async def callback(request: Request):
                 f"事件編號：{incident_id}\n"
                 f"事故地點：{text}\n"
                 "請相關救護人員前往處理。\n"
-                "收到通知的救護成員，請依自身狀況選擇回報。"
+                "收到通知的群組成員，請依自身狀況選擇回報。"
             )
             line_bot_api.reply_message(
                 event.reply_token,
