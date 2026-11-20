@@ -1,6 +1,9 @@
+
 import os
 import uuid
 import asyncio
+import json
+import urllib.request
 from datetime import datetime, timezone, timedelta
 from urllib.parse import parse_qs
 
@@ -31,11 +34,11 @@ TAIWAN_TZ = timezone(timedelta(hours=8))
 WAIT_SECONDS = 5 * 60
 
 # 僅存放記憶體；Render 重啟、重新部署或服務休眠重啟後，資料可能消失。
-pending_locations = {}       # group_id -> pending start data
-pending_corrections = {}     # group_id -> pending correction data
-active_incidents = {}        # group_id -> active incident data
-pending_closures = {}        # group_id -> close confirmation data
-timeout_tasks = {}           # (kind, group_id) -> asyncio.Task
+pending_locations = {}
+pending_corrections = {}
+active_incidents = {}
+pending_closures = {}
+timeout_tasks = {}
 
 
 def now_tw():
@@ -84,12 +87,16 @@ def schedule_timeout(kind, group_id, created_at):
                     if kind == "location":
                         line_bot_api.push_message(
                             group_id,
-                            TextSendMessage(text="⌛ 已超過 5 分鐘未收到事故地點，緊急救護啟動流程已自動取消。")
+                            TextSendMessage(
+                                text="⌛ 已超過 5 分鐘未收到事故地點，緊急救護啟動流程已自動取消。"
+                            )
                         )
                     else:
                         line_bot_api.push_message(
                             group_id,
-                            TextSendMessage(text="⌛ 已超過 5 分鐘未收到新的事故地點，本次修正已自動取消，維持原事故地點。")
+                            TextSendMessage(
+                                text="⌛ 已超過 5 分鐘未收到新的事故地點，本次修正已自動取消，維持原事故地點。"
+                            )
                         )
                 except Exception:
                     pass
@@ -99,7 +106,6 @@ def schedule_timeout(kind, group_id, created_at):
     try:
         timeout_tasks[key] = asyncio.create_task(wait_and_expire())
     except RuntimeError:
-        # 若當下沒有可用 event loop，後續仍會在收到訊息時依時間差檢查逾時。
         pass
 
 
@@ -142,10 +148,26 @@ def panel_message():
             "layout": "vertical",
             "spacing": "md",
             "contents": [
-                {"type": "text", "text": "廠區緊急救護面板", "weight": "bold", "size": "lg"},
-                {"type": "text", "text": "發生緊急狀況時，請點選下方按鈕啟動救護通知。", "wrap": True, "size": "sm", "color": "#666666"},
-                {"type": "button", "style": "primary", "color": "#D93025", "height": "md",
-                 "action": postback("🚨 緊急救護", "action=start_emergency")}
+                {
+                    "type": "text",
+                    "text": "廠區緊急救護面板",
+                    "weight": "bold",
+                    "size": "lg"
+                },
+                {
+                    "type": "text",
+                    "text": "發生緊急狀況時，請點選下方按鈕啟動救護通知。",
+                    "wrap": True,
+                    "size": "sm",
+                    "color": "#666666"
+                },
+                {
+                    "type": "button",
+                    "style": "primary",
+                    "color": "#D93025",
+                    "height": "md",
+                    "action": postback("🚨 緊急救護", "action=start_emergency")
+                }
             ]
         }
     }
@@ -156,12 +178,28 @@ def cancel_start_message():
     contents = {
         "type": "bubble",
         "body": {
-            "type": "box", "layout": "vertical", "spacing": "md",
+            "type": "box",
+            "layout": "vertical",
+            "spacing": "md",
             "contents": [
-                {"type": "text", "text": "請在群組輸入事故地點", "weight": "bold", "size": "lg"},
-                {"type": "text", "text": "任何群組成員皆可輸入。收到第一筆有效地點文字後，將立即發送緊急救護通知。等待時間為 5 分鐘。", "wrap": True, "size": "sm"},
-                {"type": "button", "style": "secondary", "height": "sm",
-                 "action": postback("取消啟動", "action=cancel_start")}
+                {
+                    "type": "text",
+                    "text": "請在群組輸入事故地點",
+                    "weight": "bold",
+                    "size": "lg"
+                },
+                {
+                    "type": "text",
+                    "text": "任何群組成員皆可輸入。收到第一筆有效地點文字後，將立即發送緊急救護通知。等待時間為 5 分鐘。",
+                    "wrap": True,
+                    "size": "sm"
+                },
+                {
+                    "type": "button",
+                    "style": "secondary",
+                    "height": "sm",
+                    "action": postback("取消啟動", "action=cancel_start")
+                }
             ]
         }
     }
@@ -172,48 +210,184 @@ def cancel_correction_message():
     contents = {
         "type": "bubble",
         "body": {
-            "type": "box", "layout": "vertical", "spacing": "md",
+            "type": "box",
+            "layout": "vertical",
+            "spacing": "md",
             "contents": [
-                {"type": "text", "text": "請輸入新的事故地點", "weight": "bold", "size": "lg"},
-                {"type": "text", "text": "任何群組成員皆可提供新地點；5 分鐘內未收到內容將自動取消。", "wrap": True, "size": "sm"},
-                {"type": "button", "style": "secondary", "height": "sm",
-                 "action": postback("取消修正", "action=cancel_correction")}
+                {
+                    "type": "text",
+                    "text": "請輸入新的事故地點",
+                    "weight": "bold",
+                    "size": "lg"
+                },
+                {
+                    "type": "text",
+                    "text": "任何群組成員皆可提供新地點；5 分鐘內未收到內容將自動取消。",
+                    "wrap": True,
+                    "size": "sm"
+                },
+                {
+                    "type": "button",
+                    "style": "secondary",
+                    "height": "sm",
+                    "action": postback("取消修正", "action=cancel_correction")
+                }
             ]
         }
     }
     return flex_message("請輸入新事故地點或取消修正", contents)
 
 
-def response_message(incident_id):
-    contents = {
+def response_message_contents(incident_id):
+    return {
         "type": "bubble",
         "body": {
-            "type": "box", "layout": "vertical", "spacing": "md",
+            "type": "box",
+            "layout": "vertical",
+            "spacing": "md",
             "contents": [
-                {"type": "text", "text": "救護人員回報", "weight": "bold", "size": "lg"},
-                {"type": "text", "text": "請收到通知的群組成員依目前狀況選擇：", "wrap": True, "size": "sm"},
-                {"type": "button", "style": "primary", "color": "#16834A", "height": "md",
-                 "action": postback("收到，可以前往", f"action=ack_available&incident_id={incident_id}")},
-                {"type": "button", "style": "primary", "color": "#B3261E", "height": "md",
-                 "action": postback("收到，但無法前往", f"action=ack_unavailable&incident_id={incident_id}")}
+                {
+                    "type": "text",
+                    "text": "救護人員回報",
+                    "weight": "bold",
+                    "size": "lg"
+                },
+                {
+                    "type": "text",
+                    "text": "請收到通知的群組成員依目前狀況選擇：",
+                    "wrap": True,
+                    "size": "sm"
+                },
+                {
+                    "type": "button",
+                    "style": "primary",
+                    "color": "#16834A",
+                    "height": "md",
+                    "action": postback(
+                        "收到，可以前往",
+                        f"action=ack_available&incident_id={incident_id}"
+                    )
+                },
+                {
+                    "type": "button",
+                    "style": "primary",
+                    "color": "#B3261E",
+                    "height": "md",
+                    "action": postback(
+                        "收到，但無法前往",
+                        f"action=ack_unavailable&incident_id={incident_id}"
+                    )
+                }
             ]
         }
     }
-    return flex_message("請回報是否可以前往支援", contents)
+
+
+def response_message(incident_id):
+    return flex_message(
+        "請回報是否可以前往支援",
+        response_message_contents(incident_id)
+    )
+
+
+def reply_emergency_notice(reply_token, notice, incident_id):
+    """
+    使用 LINE Text Message V2 發送真正的群組 @All。
+    若 API 呼叫失敗，嘗試使用原本的訊息方式發送通知及回報卡片。
+    """
+    payload = {
+        "replyToken": reply_token,
+        "messages": [
+            {
+                "type": "textV2",
+                "text": "{everyone}\n" + notice,
+                "substitution": {
+                    "everyone": {
+                        "type": "mention",
+                        "mentionee": {
+                            "type": "all"
+                        }
+                    }
+                }
+            },
+            {
+                "type": "flex",
+                "altText": "請回報是否可以前往支援",
+                "contents": response_message_contents(incident_id)
+            }
+        ]
+    }
+
+    request = urllib.request.Request(
+        "https://api.line.me/v2/bot/message/reply",
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}"
+        },
+        method="POST"
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            response.read()
+        print("緊急救護通知已透過 LINE Text V2 發送 @All。")
+
+    except Exception as error:
+        print(f"LINE @All 發送失敗，改用一般通知：{error}")
+
+        try:
+            line_bot_api.reply_message(
+                reply_token,
+                [
+                    TextSendMessage(text=notice),
+                    response_message(incident_id)
+                ]
+            )
+            print("一般緊急救護通知及回報卡片已送出。")
+        except Exception as fallback_error:
+            print(f"一般通知補送也失敗：{fallback_error}")
 
 
 def close_confirmation_message(incident_id, status_text):
     contents = {
         "type": "bubble",
         "body": {
-            "type": "box", "layout": "vertical", "spacing": "md",
+            "type": "box",
+            "layout": "vertical",
+            "spacing": "md",
             "contents": [
-                {"type": "text", "text": "確認結束救護事件？", "weight": "bold", "size": "lg"},
-                {"type": "text", "text": status_text, "wrap": True, "size": "sm"},
-                {"type": "button", "style": "primary", "color": "#D93025", "height": "md",
-                 "action": postback("確認結束", f"action=confirm_close&incident_id={incident_id}")},
-                {"type": "button", "style": "secondary", "height": "md",
-                 "action": postback("取消", f"action=cancel_close&incident_id={incident_id}")}
+                {
+                    "type": "text",
+                    "text": "確認結束救護事件？",
+                    "weight": "bold",
+                    "size": "lg"
+                },
+                {
+                    "type": "text",
+                    "text": status_text,
+                    "wrap": True,
+                    "size": "sm"
+                },
+                {
+                    "type": "button",
+                    "style": "primary",
+                    "color": "#D93025",
+                    "height": "md",
+                    "action": postback(
+                        "確認結束",
+                        f"action=confirm_close&incident_id={incident_id}"
+                    )
+                },
+                {
+                    "type": "button",
+                    "style": "secondary",
+                    "height": "md",
+                    "action": postback(
+                        "取消",
+                        f"action=cancel_close&incident_id={incident_id}"
+                    )
+                }
             ]
         }
     }
@@ -243,10 +417,10 @@ def incident_status_text(incident):
         f"無法前往：{len(unavailable)} 人",
         "",
         "🟢【可以前往】",
-        * (available if available else ["目前尚無人回報可以前往"]),
+        *(available if available else ["目前尚無人回報可以前往"]),
         "",
         "🔴【無法前往】",
-        * (unavailable if unavailable else ["目前尚無人回報無法前往"]),
+        *(unavailable if unavailable else ["目前尚無人回報無法前往"]),
         "",
     ]
     return "\n".join(lines)
@@ -281,7 +455,6 @@ async def callback(request: Request):
             continue
 
         if not group_id:
-            # 本機器人僅處理 LINE 群組操作
             if isinstance(event, MessageEvent) and isinstance(event.message, TextMessage):
                 reply_text(event.reply_token, "本功能僅供指定 LINE 群組使用。")
             continue
@@ -353,7 +526,7 @@ async def callback(request: Request):
                         "display_name": display_name,
                     }
                     status_label = "收到，可以前往" if status == "available" else "收到，但無法前往"
-                    # 同一則群組回覆同時確認個人回報，並公開更新所有人的支援名單與統計。
+
                     line_bot_api.reply_message(
                         event.reply_token,
                         [
@@ -420,7 +593,10 @@ async def callback(request: Request):
                 reply_text(event.reply_token, "只有原始啟動人員可以提出結束救護事件。")
             else:
                 status = incident_status_text(incident)
-                pending_closures[group_id] = {"incident_id": incident["id"], "initiator": user_id}
+                pending_closures[group_id] = {
+                    "incident_id": incident["id"],
+                    "initiator": user_id
+                }
                 line_bot_api.reply_message(
                     event.reply_token,
                     close_confirmation_message(incident["id"], status)
@@ -434,7 +610,10 @@ async def callback(request: Request):
             elif group_id in pending_corrections:
                 reply_text(event.reply_token, "目前已有事故地點修正流程，請先完成或取消。")
             else:
-                pending = {"created_at": now_tw(), "incident_id": incident["id"]}
+                pending = {
+                    "created_at": now_tw(),
+                    "incident_id": incident["id"]
+                }
                 pending_corrections[group_id] = pending
                 schedule_timeout("correction", group_id, pending["created_at"])
                 line_bot_api.reply_message(event.reply_token, cancel_correction_message())
@@ -445,10 +624,12 @@ async def callback(request: Request):
             if expire_if_needed("correction", group_id):
                 reply_text(event.reply_token, "事故地點修正已逾時取消，維持原事故地點。")
                 continue
+
             pending = pending_corrections.pop(group_id)
             task = timeout_tasks.pop(("correction", group_id), None)
             if task and not task.done():
                 task.cancel()
+
             incident = active_incidents.get(group_id)
             if incident and incident["id"] == pending["incident_id"]:
                 old_location = incident["location"]
@@ -471,6 +652,7 @@ async def callback(request: Request):
             if expire_if_needed("location", group_id):
                 reply_text(event.reply_token, "緊急救護啟動流程已逾時取消，請重新點選緊急救護。")
                 continue
+
             pending = pending_locations.pop(group_id)
             task = timeout_tasks.pop(("location", group_id), None)
             if task and not task.done():
@@ -494,12 +676,12 @@ async def callback(request: Request):
                 "請相關救護人員前往處理。\n"
                 "收到通知的群組成員，請依自身狀況選擇回報。"
             )
-            line_bot_api.reply_message(
+
+            # 真正的 LINE 群組 @All 通知，並附上原有救護回報卡片
+            reply_emergency_notice(
                 event.reply_token,
-                [
-                    TextSendMessage(text=notice),
-                    response_message(incident_id),
-                ]
+                notice,
+                incident_id
             )
             continue
 
