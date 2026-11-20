@@ -34,8 +34,8 @@ TAIWAN_TZ = timezone(timedelta(hours=8))
 WAIT_SECONDS = 5 * 60
 
 # 救護事件提醒設定
-INCIDENT_REMINDER_SECONDS = 60        # 1小時提醒
-INCIDENT_AUTO_CLOSE_SECONDS = 60      # 提醒後再等1小時，自動結束
+INCIDENT_REMINDER_SECONDS = 60 * 60       # 1小時提醒
+INCIDENT_AUTO_CLOSE_SECONDS = 60 * 60      # 提醒後再等1小時，自動結束
 
 # ============================================================
 # 暫存資料
