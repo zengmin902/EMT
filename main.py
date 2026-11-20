@@ -727,8 +727,7 @@ def schedule_incident_timer(group_id, incident):
 
             auto_close_text = (
                 "⏰【救護事件自動結束公告】\n"
-                f"事件編號：{incident_id}\n"
-                f"事故地點：{location}\n"
+                f"{incident_status_text(current, include_unavailable=True)}\n"
                 "本救護事件啟動已滿2小時，"
                 "因尚未執行人工結束操作，系統已自動結束本次事件。\n"
                 "如仍有救護需求，請重新啟動緊急救護流程。"
@@ -826,8 +825,8 @@ def close_confirmation_message(incident_id, status_text):
     return flex_message("請確認是否結束救護事件", contents)
 
 
-def incident_status_text(incident):
-    """護理人員與工安人員分開統計，不混算。"""
+def incident_status_text(incident, include_unavailable=False):
+    """護理人員與工安人員分開統計；進行中僅顯示可出動資訊，結束時顯示完整統計。"""
     groups = {
         "nurse": {"available": [], "unavailable": []},
         "safety": {"available": [], "unavailable": []},
@@ -848,17 +847,27 @@ def incident_status_text(incident):
         "【護理人員回報】",
         f"已回報：{sum(len(v) for v in groups['nurse'].values())} 人",
         f"可以前往：{len(groups['nurse']['available'])} 人",
-        f"無法前往：{len(groups['nurse']['unavailable'])} 人",
         "可以前往名單：" + ("、".join(groups['nurse']['available']) or "目前無"),
-        "無法前往名單：" + ("、".join(groups['nurse']['unavailable']) or "目前無"),
+    ]
+    if include_unavailable:
+        lines.extend([
+            f"無法前往：{len(groups['nurse']['unavailable'])} 人",
+            "無法前往名單：" + ("、".join(groups['nurse']['unavailable']) or "目前無"),
+        ])
+
+    lines.extend([
         "",
         "【工安人員回報】",
         f"已回報：{sum(len(v) for v in groups['safety'].values())} 人",
-        f"可以前往支援：{len(groups['safety']['available'])} 人",
-        f"無法前往支援：{len(groups['safety']['unavailable'])} 人",
+        f"可以前往：{len(groups['safety']['available'])} 人",
         "可以前往名單：" + ("、".join(groups['safety']['available']) or "目前無"),
-        "無法前往名單：" + ("、".join(groups['safety']['unavailable']) or "目前無"),
-    ]
+    ])
+    if include_unavailable:
+        lines.extend([
+            f"無法前往：{len(groups['safety']['unavailable'])} 人",
+            "無法前往名單：" + ("、".join(groups['safety']['unavailable']) or "目前無"),
+        ])
+
     return "\n".join(lines)
 
 
@@ -1179,8 +1188,7 @@ async def callback(request: Request):
                     reply_text(
                         event.reply_token,
                         f"✅ 救護事件已結束。\n"
-                        f"事件編號：{incident_id}\n"
-                        f"事故地點：{incident['location']}"
+                        f"{incident_status_text(incident, include_unavailable=True)}"
                     )
 
             # ------------------------------------------------
