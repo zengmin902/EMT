@@ -53,17 +53,16 @@ timeout_tasks = {}
 incident_timer_tasks = {}
 
 # ============================================================
-# 護理人員登記資料（測試版：僅存在記憶體）
+# 人員登記資料（測試版：僅存在記憶體）
+# 所有群組共用同一份名單；登記開關亦由最高管理者統一控制。
 # ============================================================
-# nurse_users[group_id] = {
-#     1: {"user_id": "...", "display_name": "..."},
-#     2: {"user_id": "...", "display_name": "..."},
-#     3: {"user_id": "...", "display_name": "..."},
-# }
+# nurse_users[1..3] = {"user_id": "...", "display_name": "..."}
 nurse_users = {}
+nurse_registration_open = False
 
-# 正在開放登記的群組 ID
-nurse_registration_groups = set()
+# safety_users[user_id] = {"user_id": "...", "display_name": "..."}
+safety_users = {}
+safety_registration_open = False
 
 # 每日事件流水號（測試版僅存於記憶體；重新啟動後會重新計數）
 # 格式：YYYYMMDD01；已產生的編號不回收。
@@ -113,48 +112,63 @@ def is_admin(user_id):
     return bool(user_id) and user_id == ADMIN_USER_ID
 
 
-def get_group_nurses(group_id):
-    """依護理人員 1、2、3 順序取得該群組已登記名單。"""
-    records = nurse_users.get(group_id, {})
+def get_group_nurses(group_id=None):
+    """取得全域護理人員名單，依護理人員 1、2、3 排序。"""
     return [
-        (slot, records[slot])
+        (slot, nurse_users[slot])
         for slot in (1, 2, 3)
-        if slot in records
+        if slot in nurse_users
     ]
 
 
-def get_next_nurse_slot(group_id):
+def get_next_nurse_slot():
     """回傳第一個空缺名額；沒有空缺時回傳 None。"""
-    records = nurse_users.get(group_id, {})
     for slot in (1, 2, 3):
-        if slot not in records:
+        if slot not in nurse_users:
             return slot
     return None
 
 
-def nurse_registration_status_text(group_id):
-    """整理目前三個護理人員名額的登記狀況。"""
-    records = nurse_users.get(group_id, {})
+def is_nurse(user_id):
+    return any(record.get("user_id") == user_id for record in nurse_users.values())
+
+
+def is_safety_staff(user_id):
+    return bool(user_id) and user_id in safety_users
+
+
+def get_response_role(user_id):
+    """護理人員優先；同時具兩種資格者只視為護理人員。"""
+    if is_nurse(user_id):
+        return "nurse"
+    if is_safety_staff(user_id):
+        return "safety"
+    return None
+
+
+def nurse_registration_status_text():
     lines = ["📋【護理人員登記狀況】"]
-
     for slot in (1, 2, 3):
-        record = records.get(slot)
-        if record:
-            lines.append(
-                f"護理人員{slot}：{record.get('display_name') or '群組成員'}"
-            )
-        else:
-            lines.append(f"護理人員{slot}：尚未登記")
+        record = nurse_users.get(slot)
+        lines.append(
+            f"護理人員{slot}：{record.get('display_name') or '已登記'}"
+            if record else f"護理人員{slot}：尚未登記"
+        )
+    lines.append("登記模式：開啟" if nurse_registration_open else "登記模式：關閉")
+    if nurse_registration_open:
+        next_slot = get_next_nurse_slot()
+        lines.append(f"下一個登記名額：護理人員{next_slot}" if next_slot else "三名額滿")
+    return "\n".join(lines)
 
-    if group_id in nurse_registration_groups:
-        next_slot = get_next_nurse_slot(group_id)
-        if next_slot:
-            lines.append(f"登記模式：開啟（下一位登記為護理人員{next_slot}）")
-        else:
-            lines.append("登記模式：名額已滿")
+
+def safety_registration_status_text():
+    lines = ["📋【工安人員登記狀況】", f"已登記人數：{len(safety_users)} 人"]
+    lines.append("登記模式：開啟" if safety_registration_open else "登記模式：關閉")
+    if safety_users:
+        for index, record in enumerate(safety_users.values(), 1):
+            lines.append(f"{index}. {record.get('display_name') or '工安人員'}")
     else:
-        lines.append("登記模式：關閉")
-
+        lines.append("目前尚無登記人員")
     return "\n".join(lines)
 
 
@@ -300,6 +314,62 @@ def panel_message():
     return flex_message("廠區緊急救護面板", contents)
 
 
+def registration_prompt_message(role):
+    if role == "nurse":
+        title = "護理人員登記"
+        description = "目前開放護理人員登記，名額依序安排護理人員1、2、3。登記後立即生效。"
+        label = "我要登記為護理人員"
+        action = "register_nurse"
+    else:
+        title = "工安人員登記"
+        description = "目前開放工安人員登記。登記後立即生效，僅限實際工安人員操作。"
+        label = "我要登記為工安人員"
+        action = "register_safety"
+    contents = {
+        "type": "bubble",
+        "body": {"type": "box", "layout": "vertical", "spacing": "md", "contents": [
+            {"type": "text", "text": title, "weight": "bold", "size": "lg"},
+            {"type": "text", "text": description, "wrap": True, "size": "sm"},
+            {"type": "button", "style": "primary", "height": "md", "action": postback(label, f"action={action}")}
+        ]}
+    }
+    return flex_message(title, contents)
+
+
+def admin_roster_message():
+    contents = [
+        {"type": "text", "text": "人員登記管理", "weight": "bold", "size": "lg"},
+        {"type": "text", "text": "最高管理者專用；護理人員與工安人員名單全域共用。", "wrap": True, "size": "xs", "color": "#666666"},
+        {"type": "separator", "margin": "md"},
+        {"type": "text", "text": "護理人員登記：" + ("開啟" if nurse_registration_open else "關閉"), "weight": "bold", "size": "sm"},
+        {"type": "button", "style": "primary", "action": postback("開啟護理人員登記", "action=admin_nurse_open")},
+        {"type": "button", "style": "secondary", "action": postback("關閉護理人員登記", "action=admin_nurse_close")},
+        {"type": "text", "text": "工安人員登記：" + ("開啟" if safety_registration_open else "關閉"), "weight": "bold", "size": "sm", "margin": "md"},
+        {"type": "button", "style": "primary", "action": postback("開啟工安人員登記", "action=admin_safety_open")},
+        {"type": "button", "style": "secondary", "action": postback("關閉工安人員登記", "action=admin_safety_close")},
+        {"type": "separator", "margin": "md"},
+        {"type": "text", "text": "護理人員名單", "weight": "bold", "size": "sm"},
+    ]
+    for slot in (1, 2, 3):
+        rec = nurse_users.get(slot)
+        label = f"護理人員{slot}：{rec.get('display_name')}" if rec else f"護理人員{slot}：尚未登記"
+        contents.append({"type": "text", "text": label, "size": "sm", "wrap": True})
+        if rec:
+            contents.append({"type": "button", "style": "secondary", "height": "sm", "action": postback(f"刪除護理人員{slot}", f"action=admin_delete_nurse&slot={slot}")})
+    contents.extend([
+        {"type": "separator", "margin": "md"},
+        {"type": "text", "text": f"工安人員名單（{len(safety_users)}人）", "weight": "bold", "size": "sm"},
+    ])
+    for index, (uid, rec) in enumerate(safety_users.items()):
+        if index >= 10:
+            contents.append({"type": "text", "text": "其餘工安人員請使用「查詢工安人員」及「刪除工安人員 顯示名稱」指令管理。", "size": "xs", "wrap": True, "color": "#666666"})
+            break
+        contents.append({"type": "text", "text": rec.get("display_name") or "工安人員", "size": "sm", "wrap": True})
+        contents.append({"type": "button", "style": "secondary", "height": "sm", "action": postback("刪除此工安人員", f"action=admin_delete_safety&target={uid}")})
+    contents.append({"type": "button", "style": "secondary", "action": postback("重新整理名單", "action=admin_roster")})
+    return flex_message("人員登記管理", {"type": "bubble", "body": {"type": "box", "layout": "vertical", "spacing": "sm", "contents": contents}})
+
+
 def cancel_start_message():
     contents = {
         "type": "bubble",
@@ -379,47 +449,42 @@ def cancel_correction_message():
 
 
 def response_message_contents(incident_id):
+    """同一張 Flex 卡片分成護理人員及工安人員兩個獨立回報區。"""
+    def response_buttons(role, available_label, unavailable_label):
+        return [
+            {
+                "type": "button", "style": "primary", "color": "#16834A",
+                "height": "md",
+                "action": postback(
+                    available_label,
+                    f"action=ack_{role}_available&incident_id={incident_id}"
+                )
+            },
+            {
+                "type": "button", "style": "primary", "color": "#B3261E",
+                "height": "md",
+                "action": postback(
+                    unavailable_label,
+                    f"action=ack_{role}_unavailable&incident_id={incident_id}"
+                )
+            },
+        ]
+
+    contents = [
+        {"type": "text", "text": "救護人員回報", "weight": "bold", "size": "lg"},
+        {"type": "text", "text": "請依登記身分選擇專屬回報區；每人僅記錄第一次回報。", "wrap": True, "size": "sm"},
+        {"type": "separator", "margin": "md"},
+        {"type": "text", "text": "護理人員回報（已登記護理人員專用）", "weight": "bold", "size": "md", "color": "#16834A"},
+    ]
+    contents.extend(response_buttons("nurse", "收到，可以前往", "收到，但無法前往"))
+    contents.extend([
+        {"type": "separator", "margin": "md"},
+        {"type": "text", "text": "工安人員回報（已登記工安人員專用）", "weight": "bold", "size": "md", "color": "#2563EB"},
+    ])
+    contents.extend(response_buttons("safety", "收到，可以前往支援", "收到，但無法前往支援"))
     return {
         "type": "bubble",
-        "body": {
-            "type": "box",
-            "layout": "vertical",
-            "spacing": "md",
-            "contents": [
-                {
-                    "type": "text",
-                    "text": "救護人員回報",
-                    "weight": "bold",
-                    "size": "lg"
-                },
-                {
-                    "type": "text",
-                    "text": "請收到通知的群組成員依目前狀況選擇：",
-                    "wrap": True,
-                    "size": "sm"
-                },
-                {
-                    "type": "button",
-                    "style": "primary",
-                    "color": "#16834A",
-                    "height": "md",
-                    "action": postback(
-                        "收到，可以前往",
-                        f"action=ack_available&incident_id={incident_id}"
-                    )
-                },
-                {
-                    "type": "button",
-                    "style": "primary",
-                    "color": "#B3261E",
-                    "height": "md",
-                    "action": postback(
-                        "收到，但無法前往",
-                        f"action=ack_unavailable&incident_id={incident_id}"
-                    )
-                }
-            ]
-        }
+        "body": {"type": "box", "layout": "vertical", "spacing": "md", "contents": contents}
     }
 
 
@@ -436,7 +501,7 @@ def response_message(incident_id):
 def reply_emergency_notice(reply_token, notice, incident_id, group_id):
     """
     使用 LINE Text Message V2 同時真正 @All 及 @已登記護理人員。
-    只標記該群組已完成登記的護理人員；空缺名額不會影響通知。
+    標記全域名單中已登記的護理人員；空缺名額不會影響通知。
     若 API 呼叫失敗，改用一般通知及回報卡片。
     """
     substitutions = {
@@ -450,7 +515,7 @@ def reply_emergency_notice(reply_token, notice, incident_id, group_id):
 
     mention_tokens = []
 
-    for slot, record in get_group_nurses(group_id):
+    for slot, record in get_group_nurses():
         user_id = record.get("user_id")
         if not user_id:
             continue
@@ -762,37 +827,38 @@ def close_confirmation_message(incident_id, status_text):
 
 
 def incident_status_text(incident):
-    """統計所有已回報群組成員。"""
-    available = []
-    unavailable = []
-
+    """護理人員與工安人員分開統計，不混算。"""
+    groups = {
+        "nurse": {"available": [], "unavailable": []},
+        "safety": {"available": [], "unavailable": []},
+    }
     for record in incident["responses"].values():
+        role = record.get("role")
+        if role not in groups:
+            continue
         name = record.get("display_name") or "群組成員"
         entry = f"{name}｜{time_text(record['time'])}"
-
-        if record["status"] == "available":
-            available.append(entry)
-        else:
-            unavailable.append(entry)
-
-    responded_count = len(available) + len(unavailable)
+        groups[role][record["status"]].append(entry)
 
     lines = [
-        "📋【緊急救護即時支援狀況】",
+        "📋【緊急救護即時回報狀況】",
         f"事件編號：{incident['id']}",
         f"事故地點：{incident['location']}",
-        f"已回報總人數：{responded_count} 人",
-        f"可以前往：{len(available)} 人",
-        f"無法前往：{len(unavailable)} 人",
         "",
-        "🟢【可以前往】",
-        *(available if available else ["目前尚無人回報可以前往"]),
+        "【護理人員回報】",
+        f"已回報：{sum(len(v) for v in groups['nurse'].values())} 人",
+        f"可以前往：{len(groups['nurse']['available'])} 人",
+        f"無法前往：{len(groups['nurse']['unavailable'])} 人",
+        "可以前往名單：" + ("、".join(groups['nurse']['available']) or "目前無"),
+        "無法前往名單：" + ("、".join(groups['nurse']['unavailable']) or "目前無"),
         "",
-        "🔴【無法前往】",
-        *(unavailable if unavailable else ["目前尚無人回報無法前往"]),
-        "",
+        "【工安人員回報】",
+        f"已回報：{sum(len(v) for v in groups['safety'].values())} 人",
+        f"可以前往支援：{len(groups['safety']['available'])} 人",
+        f"無法前往支援：{len(groups['safety']['unavailable'])} 人",
+        "可以前往名單：" + ("、".join(groups['safety']['available']) or "目前無"),
+        "無法前往名單：" + ("、".join(groups['safety']['unavailable']) or "目前無"),
     ]
-
     return "\n".join(lines)
 
 
@@ -813,6 +879,7 @@ def home():
 
 @app.post("/callback")
 async def callback(request: Request):
+    global nurse_registration_open, safety_registration_open
     signature = request.headers.get("X-Line-Signature", "")
     body = await request.body()
     body_text = body.decode("utf-8")
@@ -861,6 +928,76 @@ async def callback(request: Request):
             action = data.get("action", [""])[0]
             user_id = get_user_id(event)
             incident_id = data.get("incident_id", [""])[0]
+
+            # ------------------------------------------------
+            # 最高管理者人員管理面板按鈕
+            # ------------------------------------------------
+            if action.startswith("admin_"):
+                if not is_admin(user_id):
+                    reply_text(event.reply_token, "⛔ 此操作僅限最高管理者執行。")
+                elif action == "admin_nurse_open":
+                    if get_next_nurse_slot() is None:
+                        reply_text(event.reply_token, "三名護理人員名額已滿。")
+                    else:
+                        nurse_registration_open = True
+                        line_bot_api.reply_message(event.reply_token, registration_prompt_message("nurse"))
+                elif action == "admin_nurse_close":
+                    nurse_registration_open = False
+                    line_bot_api.reply_message(event.reply_token, admin_roster_message())
+                elif action == "admin_safety_open":
+                    safety_registration_open = True
+                    line_bot_api.reply_message(event.reply_token, registration_prompt_message("safety"))
+                elif action == "admin_safety_close":
+                    safety_registration_open = False
+                    line_bot_api.reply_message(event.reply_token, admin_roster_message())
+                elif action == "admin_delete_nurse":
+                    try:
+                        slot = int(data.get("slot", ["0"])[0])
+                    except ValueError:
+                        slot = 0
+                    removed = nurse_users.pop(slot, None) if slot in (1, 2, 3) else None
+                    line_bot_api.reply_message(event.reply_token, admin_roster_message())
+                elif action == "admin_delete_safety":
+                    target = data.get("target", [""])[0]
+                    safety_users.pop(target, None)
+                    line_bot_api.reply_message(event.reply_token, admin_roster_message())
+                elif action == "admin_roster":
+                    line_bot_api.reply_message(event.reply_token, admin_roster_message())
+                continue
+
+            # ------------------------------------------------
+            # 人員自行登記按鈕（開放時立即生效，不需核准）
+            # ------------------------------------------------
+            if action in ("register_nurse", "register_safety"):
+                if not user_id:
+                    reply_text(event.reply_token, "無法辨識你的 LINE 帳號，請確認以個人 LINE 帳號操作。")
+                elif action == "register_nurse":
+                    if not nurse_registration_open:
+                        reply_text(event.reply_token, "目前未開放護理人員登記。")
+                    elif is_nurse(user_id):
+                        slot = next(slot for slot, rec in nurse_users.items() if rec.get("user_id") == user_id)
+                        reply_text(event.reply_token, f"你已登記為護理人員{slot}，不需重複登記。")
+                    else:
+                        slot = get_next_nurse_slot()
+                        if slot is None:
+                            nurse_registration_open = False
+                            reply_text(event.reply_token, "三名護理人員名額已滿，登記已自動關閉。")
+                        else:
+                            display_name = get_display_name(group_id, user_id)
+                            nurse_users[slot] = {"user_id": user_id, "display_name": display_name}
+                            if get_next_nurse_slot() is None:
+                                nurse_registration_open = False
+                            reply_text(event.reply_token, f"✅ 護理人員{slot}登記成功！\n登記人員：{display_name}\n" + nurse_registration_status_text())
+                else:
+                    if not safety_registration_open:
+                        reply_text(event.reply_token, "目前未開放工安人員登記。")
+                    elif is_safety_staff(user_id):
+                        reply_text(event.reply_token, "你已登記為工安人員，不需重複登記。")
+                    else:
+                        display_name = get_display_name(group_id, user_id)
+                        safety_users[user_id] = {"user_id": user_id, "display_name": display_name}
+                        reply_text(event.reply_token, f"✅ 工安人員登記成功！\n登記人員：{display_name}\n" + safety_registration_status_text())
+                continue
 
             # ------------------------------------------------
             # 啟動緊急救護
@@ -959,79 +1096,58 @@ async def callback(request: Request):
                     )
 
             # ------------------------------------------------
-            # 救護人員回報
+            # 護理人員／工安人員分流回報
             # ------------------------------------------------
-            elif action in ("ack_available", "ack_unavailable"):
+            elif action in (
+                "ack_nurse_available", "ack_nurse_unavailable",
+                "ack_safety_available", "ack_safety_unavailable"
+            ):
                 incident = active_incidents.get(group_id)
+                requested_role = "nurse" if action.startswith("ack_nurse_") else "safety"
+                status = "available" if action.endswith("_available") else "unavailable"
+                actual_role = get_response_role(user_id)
 
                 if not incident or incident["id"] != incident_id:
-                    reply_text(
-                        event.reply_token,
-                        "此救護事件已結束或通知已失效。"
-                    )
-
+                    reply_text(event.reply_token, "此救護事件已結束或通知已失效。")
                 elif not user_id:
-                    reply_text(
-                        event.reply_token,
-                        "無法辨識回報帳號，請確認以個人 LINE 帳號操作。"
-                    )
-
+                    reply_text(event.reply_token, "無法辨識回報帳號，請確認以個人 LINE 帳號操作。")
+                elif actual_role is None:
+                    reply_text(event.reply_token, "你尚未登記為護理人員或工安人員，無法使用專屬回報功能。")
+                elif actual_role != requested_role:
+                    if actual_role == "nurse":
+                        reply_text(event.reply_token, "你已登記為護理人員，請使用「護理人員回報」區，不需使用工安人員回報區。")
+                    else:
+                        reply_text(event.reply_token, "此按鈕僅限已登記護理人員使用，請使用「工安人員回報」區。")
                 elif user_id in incident["responses"]:
                     old = incident["responses"][user_id]
-
-                    old_status = (
-                        "可以前往"
-                        if old["status"] == "available"
-                        else "無法前往"
-                    )
-
+                    old_status = "可以前往" if old["status"] == "available" else "無法前往"
                     reply_text(
                         event.reply_token,
-                        f"已收到你的回報，不重複更新紀錄。\n"
-                        f"首次回報狀態：{old_status}\n"
-                        f"首次回報時間：{time_text(old['time'])}"
+                        f"已收到你的回報，不重複更新紀錄。\n首次回報身分：{'護理人員' if old.get('role') == 'nurse' else '工安人員'}\n首次回報狀態：{old_status}\n首次回報時間：{time_text(old['time'])}"
                     )
-
                 else:
-                    status = (
-                        "available"
-                        if action == "ack_available"
-                        else "unavailable"
-                    )
-
-                    display_name = get_display_name(
-                        group_id,
-                        user_id
-                    )
-
+                    display_name = get_display_name(group_id, user_id)
                     timestamp = now_tw()
-
                     incident["responses"][user_id] = {
+                        "role": actual_role,
                         "status": status,
                         "time": timestamp,
                         "display_name": display_name,
                     }
-
+                    role_label = "護理人員" if actual_role == "nurse" else "工安人員"
                     status_label = (
-                        "收到，可以前往"
-                        if status == "available"
+                        "收到，可以前往" if status == "available"
                         else "收到，但無法前往"
                     )
-
                     line_bot_api.reply_message(
                         event.reply_token,
                         [
-                            TextSendMessage(
-                                text=(
-                                    f"✅ 救護回報已登記\n"
-                                    f"回報人員：{display_name}\n"
-                                    f"回報狀態：{status_label}\n"
-                                    f"首次回報時間：{time_text(timestamp)}"
-                                )
-                            ),
-                            TextSendMessage(
-                                text=incident_status_text(incident)
-                            ),
+                            TextSendMessage(text=(
+                                f"✅ 回報已登記\n回報身分：{role_label}\n"
+                                f"回報人員：{display_name}\n回報狀態：{status_label}\n"
+                                f"首次回報時間：{time_text(timestamp)}"
+                            )),
+                            TextSendMessage(text=incident_status_text(incident)),
                         ]
                     )
 
@@ -1106,186 +1222,142 @@ async def callback(request: Request):
         user_id = get_user_id(event)
 
         # ----------------------------------------------------
-        # 護理人員登記管理（僅最高管理者可執行管理命令）
+        # 人員登記管理（全域名單；僅最高管理者可開關及管理）
         # ----------------------------------------------------
         if text == "啟動護理人員登記":
             if not is_admin(user_id):
-                reply_text(
-                    event.reply_token,
-                    "⛔ 此操作僅限最高管理者執行。"
-                )
+                reply_text(event.reply_token, "⛔ 此操作僅限最高管理者執行。")
+            elif get_next_nurse_slot() is None:
+                reply_text(event.reply_token, "三名護理人員名額均已登記完成。\n" + nurse_registration_status_text())
             else:
-                next_slot = get_next_nurse_slot(group_id)
-                if next_slot is None:
-                    nurse_registration_groups.discard(group_id)
-                    reply_text(
-                        event.reply_token,
-                        "三名護理人員名額均已登記完成。\n"
-                        + nurse_registration_status_text(group_id)
-                    )
-                else:
-                    nurse_registration_groups.add(group_id)
-                    reply_text(
-                        event.reply_token,
-                        "✅ 已開啟護理人員登記。\n"
-                        "請欲登記的人員依序在群組輸入：我要登記護理人員\n"
-                        f"目前下一個名額：護理人員{next_slot}\n"
-                        "每位人員只能登記一次；登記滿三名後會自動關閉。"
-                    )
-
+                nurse_registration_open = True
+                line_bot_api.reply_message(event.reply_token, registration_prompt_message("nurse"))
             continue
 
-        if text == "取消護理人員登記":
+        if text in ("取消護理人員登記", "關閉護理人員登記"):
             if not is_admin(user_id):
-                reply_text(
-                    event.reply_token,
-                    "⛔ 此操作僅限最高管理者執行。"
-                )
-            elif group_id in nurse_registration_groups:
-                nurse_registration_groups.discard(group_id)
-                reply_text(
-                    event.reply_token,
-                    "已關閉護理人員登記模式；已登記名單不受影響。\n"
-                    + nurse_registration_status_text(group_id)
-                )
+                reply_text(event.reply_token, "⛔ 此操作僅限最高管理者執行。")
             else:
-                reply_text(
-                    event.reply_token,
-                    "目前沒有開啟中的護理人員登記模式。"
-                )
-
+                nurse_registration_open = False
+                reply_text(event.reply_token, "已關閉護理人員登記；既有名單不受影響。\n" + nurse_registration_status_text())
             continue
 
-        if text == "查詢護理人員登記":
+        if text == "啟動工安人員登記":
             if not is_admin(user_id):
-                reply_text(
-                    event.reply_token,
-                    "⛔ 此操作僅限最高管理者執行。"
-                )
+                reply_text(event.reply_token, "⛔ 此操作僅限最高管理者執行。")
             else:
-                reply_text(
-                    event.reply_token,
-                    nurse_registration_status_text(group_id)
-                )
-
+                safety_registration_open = True
+                line_bot_api.reply_message(event.reply_token, registration_prompt_message("safety"))
             continue
 
-        if text in (
-            "刪除護理人員1",
-            "刪除護理人員2",
-            "刪除護理人員3"
-        ):
+        if text in ("關閉工安人員登記", "取消工安人員登記"):
             if not is_admin(user_id):
-                reply_text(
-                    event.reply_token,
-                    "⛔ 此操作僅限最高管理者執行。"
-                )
+                reply_text(event.reply_token, "⛔ 此操作僅限最高管理者執行。")
+            else:
+                safety_registration_open = False
+                reply_text(event.reply_token, "已關閉工安人員登記；既有名單不受影響。\n" + safety_registration_status_text())
+            continue
+
+        if text in ("查詢護理人員登記", "查詢護理人員"):
+            if not is_admin(user_id):
+                reply_text(event.reply_token, "⛔ 此操作僅限最高管理者執行。")
+            else:
+                reply_text(event.reply_token, nurse_registration_status_text())
+            continue
+
+        if text in ("查詢工安人員", "查詢工安人員登記"):
+            if not is_admin(user_id):
+                reply_text(event.reply_token, "⛔ 此操作僅限最高管理者執行。")
+            else:
+                reply_text(event.reply_token, safety_registration_status_text())
+            continue
+
+        if text in ("查詢人員名單", "人員管理"):
+            if not is_admin(user_id):
+                reply_text(event.reply_token, "⛔ 此操作僅限最高管理者執行。")
+            else:
+                line_bot_api.reply_message(event.reply_token, admin_roster_message())
+            continue
+
+        if text in ("刪除護理人員1", "刪除護理人員2", "刪除護理人員3"):
+            if not is_admin(user_id):
+                reply_text(event.reply_token, "⛔ 此操作僅限最高管理者執行。")
             else:
                 slot = int(text[-1])
-                records = nurse_users.get(group_id, {})
-                removed = records.pop(slot, None)
-
-                if not records:
-                    nurse_users.pop(group_id, None)
-
-                if removed:
-                    reply_text(
-                        event.reply_token,
-                        f"✅ 已刪除護理人員{slot}："
-                        f"{removed.get('display_name') or '群組成員'}。\n"
-                        "其他已登記人員不受影響。\n"
-                        + nurse_registration_status_text(group_id)
-                    )
-                else:
-                    reply_text(
-                        event.reply_token,
-                        f"護理人員{slot}目前沒有登記資料。\n"
-                        + nurse_registration_status_text(group_id)
-                    )
-
+                removed = nurse_users.pop(slot, None)
+                reply_text(event.reply_token, (f"✅ 已刪除護理人員{slot}：{removed.get('display_name') or '群組成員'}。\n" if removed else f"護理人員{slot}目前沒有登記資料。\n") + nurse_registration_status_text())
             continue
 
         if text == "重設護理人員名單":
             if not is_admin(user_id):
-                reply_text(
-                    event.reply_token,
-                    "⛔ 此操作僅限最高管理者執行。"
-                )
+                reply_text(event.reply_token, "⛔ 此操作僅限最高管理者執行。")
             else:
-                nurse_users.pop(group_id, None)
-                nurse_registration_groups.discard(group_id)
-                reply_text(
-                    event.reply_token,
-                    "✅ 已清空本群組全部護理人員名單，登記模式已關閉。\n"
-                    + nurse_registration_status_text(group_id)
-                )
-
+                nurse_users.clear()
+                nurse_registration_open = False
+                reply_text(event.reply_token, "✅ 已清空全部護理人員名單，登記模式已關閉。\n" + nurse_registration_status_text())
             continue
 
-        if text == "我要登記護理人員":
-            if group_id not in nurse_registration_groups:
-                reply_text(
-                    event.reply_token,
-                    "目前未開放護理人員登記，請聯絡最高管理者啟動登記。"
-                )
-                continue
-
-            if not user_id:
-                reply_text(
-                    event.reply_token,
-                    "無法辨識你的 LINE 帳號，請確認以個人 LINE 帳號操作。"
-                )
-                continue
-
-            records = nurse_users.setdefault(group_id, {})
-            already_registered_slot = next(
-                (
-                    slot for slot, record in records.items()
-                    if record.get("user_id") == user_id
-                ),
-                None
-            )
-
-            if already_registered_slot is not None:
-                reply_text(
-                    event.reply_token,
-                    f"你已登記為護理人員{already_registered_slot}，不需重複登記。"
-                )
-                continue
-
-            next_slot = get_next_nurse_slot(group_id)
-
-            if next_slot is None:
-                nurse_registration_groups.discard(group_id)
-                reply_text(
-                    event.reply_token,
-                    "三名護理人員名額已滿，登記模式已自動關閉。"
-                )
-                continue
-
-            display_name = get_display_name(group_id, user_id)
-            records[next_slot] = {
-                "user_id": user_id,
-                "display_name": display_name
-            }
-
-            if get_next_nurse_slot(group_id) is None:
-                nurse_registration_groups.discard(group_id)
-                completion_text = "三名護理人員名額已滿，登記模式已自動關閉。"
+        if text == "重設工安人員名單":
+            if not is_admin(user_id):
+                reply_text(event.reply_token, "⛔ 此操作僅限最高管理者執行。")
             else:
-                following_slot = get_next_nurse_slot(group_id)
-                completion_text = (
-                    f"下一位登記者將登記為護理人員{following_slot}。"
-                )
+                safety_users.clear()
+                safety_registration_open = False
+                reply_text(event.reply_token, "✅ 已清空全部工安人員名單，登記模式已關閉。\n" + safety_registration_status_text())
+            continue
 
-            reply_text(
-                event.reply_token,
-                f"✅ 登記成功！\n"
-                f"登記身分：護理人員{next_slot}\n"
-                f"登記人員：{display_name}\n"
-                f"{completion_text}\n"
-                + nurse_registration_status_text(group_id)
-            )
+        # 舊文字登記指令保留相容；新流程以按鈕為主。
+        if text == "我要登記護理人員":
+            if not nurse_registration_open:
+                reply_text(event.reply_token, "目前未開放護理人員登記，請聯絡最高管理者。")
+                continue
+            if not user_id:
+                reply_text(event.reply_token, "無法辨識你的 LINE 帳號。")
+                continue
+            existing = next((slot for slot, rec in nurse_users.items() if rec.get("user_id") == user_id), None)
+            if existing:
+                reply_text(event.reply_token, f"你已登記為護理人員{existing}。")
+                continue
+            slot = get_next_nurse_slot()
+            if slot is None:
+                nurse_registration_open = False
+                reply_text(event.reply_token, "三名護理人員名額已滿。")
+                continue
+            display_name = get_display_name(group_id, user_id)
+            nurse_users[slot] = {"user_id": user_id, "display_name": display_name}
+            if get_next_nurse_slot() is None:
+                nurse_registration_open = False
+            reply_text(event.reply_token, f"✅ 護理人員{slot}登記成功：{display_name}。\n" + nurse_registration_status_text())
+            continue
+
+        if text == "我要登記工安人員":
+            if not safety_registration_open:
+                reply_text(event.reply_token, "目前未開放工安人員登記，請聯絡最高管理者。")
+                continue
+            if not user_id:
+                reply_text(event.reply_token, "無法辨識你的 LINE 帳號。")
+                continue
+            if user_id in safety_users:
+                reply_text(event.reply_token, "你已登記為工安人員，不需重複登記。")
+                continue
+            display_name = get_display_name(group_id, user_id)
+            safety_users[user_id] = {"user_id": user_id, "display_name": display_name}
+            reply_text(event.reply_token, f"✅ 工安人員登記成功：{display_name}。\n" + safety_registration_status_text())
+            continue
+
+        if text.startswith("刪除工安人員 "):
+            if not is_admin(user_id):
+                reply_text(event.reply_token, "⛔ 此操作僅限最高管理者執行。")
+            else:
+                target_name = text.replace("刪除工安人員 ", "", 1).strip()
+                matches = [uid for uid, rec in safety_users.items() if rec.get("display_name") == target_name or uid == target_name]
+                if len(matches) == 1:
+                    removed = safety_users.pop(matches[0])
+                    reply_text(event.reply_token, f"✅ 已刪除工安人員：{removed.get('display_name') or '工安人員'}。\n" + safety_registration_status_text())
+                elif len(matches) > 1:
+                    reply_text(event.reply_token, "同名人員不只一位，請使用人員管理面板個別刪除。")
+                else:
+                    reply_text(event.reply_token, "找不到指定工安人員，請先查詢名單。")
             continue
 
         # ----------------------------------------------------
@@ -1484,7 +1556,7 @@ async def callback(request: Request):
                 f"事件編號：{incident_id}\n"
                 f"事故地點：{text}\n"
                 "請相關救護人員前往處理。\n"
-                "收到通知的群組成員，請依自身狀況選擇回報。"
+                "已登記護理人員及工安人員，請依身分使用專屬按鈕回報。"
             )
 
             # 保留原有真正的 LINE 群組 @All 通知
