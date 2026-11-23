@@ -37,37 +37,26 @@ parser = WebhookParser(CHANNEL_SECRET)
 TAIWAN_TZ = timezone(timedelta(hours=8))
 WAIT_SECONDS = 5 * 60
 
-# 救護事件提醒設定
-INCIDENT_REMINDER_SECONDS = 60 * 60       # 1小時提醒
-INCIDENT_AUTO_CLOSE_SECONDS = 60 * 60      # 提醒後再等1小時，自動結束
+# 救護事件自動結束設定：啟動滿 1 小時自動結束
+INCIDENT_AUTO_CLOSE_SECONDS = 60 * 60
 
 # ============================================================
-# 暫存資料
+# 暫存資料（正式事件、地點歷程及所有回應紀錄均永久保存於 PostgreSQL）
 # ============================================================
-# 等待中的5分鐘輸入流程僅暫存於記憶體；正式事件及名單均保存於 PostgreSQL。
 pending_locations = {}
 pending_corrections = {}
 active_incidents = {}
 pending_closures = {}
+admin_pending_closures = {}
 timeout_tasks = {}
 
 # 每個群組各自的救護事件定時任務
 incident_timer_tasks = {}
 
+
 # ============================================================
-# 人員登記資料由 PostgreSQL 還原至記憶體快取；所有群組共用同一份名單。
+# PostgreSQL 資料庫連線與初始化
 # ============================================================
-# nurse_users[1..3] = {"user_id": "...", "display_name": "..."}
-nurse_users = {}
-nurse_registration_open = False
-
-# safety_users[user_id] = {"user_id": "...", "display_name": "..."}
-safety_users = {}
-safety_registration_open = False
-
-# 每日事件流水號由 PostgreSQL 永久保存；格式 YYYYMMDD01。
-
-
 def get_db_connection():
     database_url = os.environ.get("DATABASE_URL", "").strip()
     if not database_url:
@@ -76,24 +65,8 @@ def get_db_connection():
 
 
 def init_database():
-    """建立所需資料表；資料庫無法使用時直接讓服務啟動失敗。"""
+    """建立所需資料表；保留既有歷史資料，資料庫無法使用時直接讓服務啟動失敗。"""
     statements = [
-        """CREATE TABLE IF NOT EXISTS app_settings (
-            setting_key TEXT PRIMARY KEY,
-            setting_value BOOLEAN NOT NULL DEFAULT FALSE,
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )""",
-        """CREATE TABLE IF NOT EXISTS nurse_roster (
-            slot SMALLINT PRIMARY KEY CHECK (slot BETWEEN 1 AND 3),
-            user_id TEXT NOT NULL UNIQUE,
-            display_name TEXT NOT NULL,
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )""",
-        """CREATE TABLE IF NOT EXISTS safety_roster (
-            user_id TEXT PRIMARY KEY,
-            display_name TEXT NOT NULL,
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )""",
         """CREATE TABLE IF NOT EXISTS event_counters (
             event_date DATE PRIMARY KEY,
             last_number INTEGER NOT NULL CHECK (last_number >= 0)
@@ -107,79 +80,75 @@ def init_database():
             created_at TIMESTAMPTZ NOT NULL,
             ended_at TIMESTAMPTZ,
             status TEXT NOT NULL DEFAULT 'active'
-                CHECK (status IN ('active', 'closed', 'auto_closed'))
+                CHECK (status IN ('active', 'closed', 'auto_closed', 'admin_closed'))
         )""",
         """CREATE UNIQUE INDEX IF NOT EXISTS one_active_incident_per_group
             ON incidents(group_id) WHERE status = 'active'""",
         """CREATE TABLE IF NOT EXISTS incident_responses (
+            response_seq BIGSERIAL PRIMARY KEY,
             incident_id TEXT NOT NULL REFERENCES incidents(incident_id),
             user_id TEXT NOT NULL,
-            role TEXT NOT NULL CHECK (role IN ('nurse', 'safety')),
-            status TEXT NOT NULL CHECK (status IN ('available', 'unavailable')),
-            responded_at TIMESTAMPTZ NOT NULL,
             display_name TEXT NOT NULL,
-            PRIMARY KEY (incident_id, user_id)
+            status TEXT NOT NULL CHECK (status IN ('available', 'unavailable')),
+            action_type TEXT NOT NULL DEFAULT 'initial'
+                CHECK (action_type IN ('initial', 'update')),
+            responded_at TIMESTAMPTZ NOT NULL
         )""",
+        """CREATE INDEX IF NOT EXISTS idx_incident_responses_incident_seq
+            ON incident_responses(incident_id, response_seq)""",
+        """CREATE TABLE IF NOT EXISTS incident_location_logs (
+            log_seq BIGSERIAL PRIMARY KEY,
+            incident_id TEXT NOT NULL REFERENCES incidents(incident_id),
+            old_location TEXT NOT NULL,
+            new_location TEXT NOT NULL,
+            updated_by TEXT NOT NULL,
+            updated_by_name TEXT NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL
+        )""",
+        """CREATE INDEX IF NOT EXISTS idx_incident_location_logs_incident_seq
+            ON incident_location_logs(incident_id, log_seq)""",
     ]
     with get_db_connection() as conn:
         with conn.cursor() as cur:
             for statement in statements:
                 cur.execute(statement)
-            cur.execute(
-                "INSERT INTO app_settings (setting_key, setting_value) VALUES "
-                "('nurse_registration_open', FALSE), ('safety_registration_open', FALSE) "
-                "ON CONFLICT (setting_key) DO NOTHING"
-            )
+            # 相容舊版資料庫結構：若舊表存在主鍵或舊欄位，安全升級以保留歷史紀錄
+            cur.execute("""
+                ALTER TABLE incidents
+                DROP CONSTRAINT IF EXISTS incidents_status_check
+            """)
+            cur.execute("""
+                ALTER TABLE incidents
+                ADD CONSTRAINT incidents_status_check
+                CHECK (status IN ('active', 'closed', 'auto_closed', 'admin_closed'))
+            """)
+            cur.execute("""
+                ALTER TABLE incident_responses
+                DROP CONSTRAINT IF EXISTS incident_responses_pkey
+            """)
+            cur.execute("""
+                ALTER TABLE incident_responses
+                ADD COLUMN IF NOT EXISTS response_seq BIGSERIAL PRIMARY KEY
+            """)
+            cur.execute("""
+                ALTER TABLE incident_responses
+                ADD COLUMN IF NOT EXISTS action_type TEXT NOT NULL DEFAULT 'initial'
+            """)
+            cur.execute("""
+                ALTER TABLE incident_responses
+                ALTER COLUMN role DROP NOT NULL
+            """) if column_exists(cur, "incident_responses", "role") else None
 
 
-def set_app_setting(key, value):
-    with get_db_connection() as conn:
-        conn.execute(
-            "INSERT INTO app_settings (setting_key, setting_value, updated_at) "
-            "VALUES (%s, %s, NOW()) ON CONFLICT (setting_key) DO UPDATE "
-            "SET setting_value = EXCLUDED.setting_value, updated_at = NOW()",
-            (key, bool(value)),
-        )
-
-
-def save_nurse_record(slot, record):
-    with get_db_connection() as conn:
-        conn.execute(
-            "INSERT INTO nurse_roster (slot, user_id, display_name, updated_at) "
-            "VALUES (%s, %s, %s, NOW()) ON CONFLICT (slot) DO UPDATE SET "
-            "user_id = EXCLUDED.user_id, display_name = EXCLUDED.display_name, updated_at = NOW()",
-            (slot, record["user_id"], record.get("display_name") or "群組成員"),
-        )
-
-
-def delete_nurse_record(slot):
-    with get_db_connection() as conn:
-        conn.execute("DELETE FROM nurse_roster WHERE slot = %s", (slot,))
-
-
-def clear_nurse_records():
-    with get_db_connection() as conn:
-        conn.execute("DELETE FROM nurse_roster")
-
-
-def save_safety_record(user_id, record):
-    with get_db_connection() as conn:
-        conn.execute(
-            "INSERT INTO safety_roster (user_id, display_name, updated_at) "
-            "VALUES (%s, %s, NOW()) ON CONFLICT (user_id) DO UPDATE SET "
-            "display_name = EXCLUDED.display_name, updated_at = NOW()",
-            (user_id, record.get("display_name") or "工安人員"),
-        )
-
-
-def delete_safety_record(user_id):
-    with get_db_connection() as conn:
-        conn.execute("DELETE FROM safety_roster WHERE user_id = %s", (user_id,))
-
-
-def clear_safety_records():
-    with get_db_connection() as conn:
-        conn.execute("DELETE FROM safety_roster")
+def column_exists(cur, table_name, column_name):
+    row = cur.execute(
+        """
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = %s AND column_name = %s
+        """,
+        (table_name, column_name),
+    ).fetchone()
+    return row is not None
 
 
 def create_incident_record(incident, group_id):
@@ -187,85 +156,192 @@ def create_incident_record(incident, group_id):
         conn.execute(
             "INSERT INTO incidents (incident_id, group_id, location, initiator, "
             "initiator_name, created_at, status) VALUES (%s, %s, %s, %s, %s, %s, 'active')",
-            (incident["id"], group_id, incident["location"], incident["initiator"],
-             incident["initiator_name"], incident["created_at"]),
+            (
+                incident["id"],
+                group_id,
+                incident["location"],
+                incident["initiator"],
+                incident["initiator_name"],
+                incident["created_at"],
+            ),
         )
 
 
-def save_incident_response(incident_id, user_id, record):
+def save_incident_response(incident_id, record):
+    """每次點擊均寫入一筆新紀錄，完整保留首次回應及後續修改歷程。"""
     with get_db_connection() as conn:
         row = conn.execute(
             "INSERT INTO incident_responses "
-            "(incident_id, user_id, role, status, responded_at, display_name) "
-            "VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (incident_id, user_id) DO NOTHING "
-            "RETURNING user_id",
-            (incident_id, user_id, record["role"], record["status"],
-             record["time"], record.get("display_name") or "群組成員"),
+            "(incident_id, user_id, display_name, status, action_type, responded_at) "
+            "VALUES (%s, %s, %s, %s, %s, %s) "
+            "RETURNING response_seq",
+            (
+                incident_id,
+                record["user_id"],
+                record.get("display_name") or "群組成員",
+                record["status"],
+                record["action_type"],
+                record["time"],
+            ),
         ).fetchone()
-        return row is not None
+        return row["response_seq"] if row else None
 
 
-def update_incident_location(incident_id, location):
+def update_incident_location(incident_id, old_location, new_location, user_id, user_name, updated_at):
+    """更新事件最新地點，並同步寫入地點修改歷史紀錄表。"""
     with get_db_connection() as conn:
         cur = conn.execute(
             "UPDATE incidents SET location = %s WHERE incident_id = %s AND status = 'active'",
-            (location, incident_id),
+            (new_location, incident_id),
         )
-        return cur.rowcount == 1
+        if cur.rowcount != 1:
+            return False
+        conn.execute(
+            "INSERT INTO incident_location_logs "
+            "(incident_id, old_location, new_location, updated_by, updated_by_name, updated_at) "
+            "VALUES (%s, %s, %s, %s, %s, %s)",
+            (incident_id, old_location, new_location, user_id, user_name, updated_at),
+        )
+        return True
 
 
-def close_incident_record(incident_id, status):
+def close_incident_record(incident_id, status, ended_at=None):
+    ended_at = ended_at or now_tw()
     with get_db_connection() as conn:
         cur = conn.execute(
-            "UPDATE incidents SET status = %s, ended_at = NOW() "
+            "UPDATE incidents SET status = %s, ended_at = %s "
             "WHERE incident_id = %s AND status = 'active'",
-            (status, incident_id),
+            (status, ended_at, incident_id),
         )
         return cur.rowcount == 1
+
+
+def fetch_incident_full_data(incident_id):
+    """從 PostgreSQL 讀取單一事件（含進行中或已結束）完整主檔、地點修改歷程與所有回應紀錄。"""
+    with get_db_connection() as conn:
+        inc_row = conn.execute(
+            "SELECT incident_id, group_id, location, initiator, initiator_name, "
+            "created_at, ended_at, status FROM incidents WHERE incident_id = %s",
+            (incident_id,),
+        ).fetchone()
+        if not inc_row:
+            return None
+
+        resp_rows = conn.execute(
+            "SELECT response_seq, user_id, display_name, status, action_type, responded_at "
+            "FROM incident_responses WHERE incident_id = %s ORDER BY response_seq ASC",
+            (incident_id,),
+        ).fetchall()
+
+        loc_rows = conn.execute(
+            "SELECT log_seq, old_location, new_location, updated_by, updated_by_name, updated_at "
+            "FROM incident_location_logs WHERE incident_id = %s ORDER BY log_seq ASC",
+            (incident_id,),
+        ).fetchall()
+
+    responses = [
+        {
+            "seq": r["response_seq"],
+            "user_id": r["user_id"],
+            "display_name": r["display_name"],
+            "status": r["status"],
+            "action_type": r["action_type"],
+            "time": r["responded_at"],
+        }
+        for r in resp_rows
+    ]
+    location_logs = [
+        {
+            "seq": l["log_seq"],
+            "old_location": l["old_location"],
+            "new_location": l["new_location"],
+            "updated_by": l["updated_by"],
+            "updated_by_name": l["updated_by_name"],
+            "updated_at": l["updated_at"],
+        }
+        for l in loc_rows
+    ]
+
+    # 推算原始啟動地點（若有修改紀錄，第一筆的 old_location 即為原始地點）
+    initial_location = location_logs[0]["old_location"] if location_logs else inc_row["location"]
+
+    return {
+        "id": inc_row["incident_id"],
+        "group_id": inc_row["group_id"],
+        "initial_location": initial_location,
+        "location": inc_row["location"],
+        "initiator": inc_row["initiator"],
+        "initiator_name": inc_row["initiator_name"],
+        "created_at": inc_row["created_at"],
+        "ended_at": inc_row["ended_at"],
+        "status": inc_row["status"],
+        "responses": responses,
+        "location_logs": location_logs,
+    }
 
 
 def load_persistent_state():
-    """載入全域人員名單、登記開關及所有進行中事件與回報。"""
-    global nurse_registration_open, safety_registration_open
+    """啟動時從 PostgreSQL 還原所有進行中事件、地點歷程與回應紀錄。"""
     with get_db_connection() as conn:
-        settings = {r["setting_key"]: r["setting_value"] for r in conn.execute(
-            "SELECT setting_key, setting_value FROM app_settings"
-        ).fetchall()}
-        nurses = conn.execute("SELECT slot, user_id, display_name FROM nurse_roster ORDER BY slot").fetchall()
-        safety = conn.execute("SELECT user_id, display_name FROM safety_roster ORDER BY updated_at, user_id").fetchall()
         incidents = conn.execute(
             "SELECT incident_id, group_id, location, initiator, initiator_name, created_at "
             "FROM incidents WHERE status = 'active' ORDER BY created_at"
         ).fetchall()
         responses = conn.execute(
-            "SELECT r.incident_id, r.user_id, r.role, r.status, r.responded_at, r.display_name "
+            "SELECT r.response_seq, r.incident_id, r.user_id, r.display_name, "
+            "r.status, r.action_type, r.responded_at "
             "FROM incident_responses r JOIN incidents i ON i.incident_id = r.incident_id "
-            "WHERE i.status = 'active' ORDER BY r.responded_at"
+            "WHERE i.status = 'active' ORDER BY r.response_seq ASC"
+        ).fetchall()
+        loc_logs = conn.execute(
+            "SELECT l.log_seq, l.incident_id, l.old_location, l.new_location, "
+            "l.updated_by, l.updated_by_name, l.updated_at "
+            "FROM incident_location_logs l JOIN incidents i ON i.incident_id = l.incident_id "
+            "WHERE i.status = 'active' ORDER BY l.log_seq ASC"
         ).fetchall()
 
-    nurse_users.clear()
-    for row in nurses:
-        nurse_users[int(row["slot"])] = {"user_id": row["user_id"], "display_name": row["display_name"]}
-    safety_users.clear()
-    for row in safety:
-        safety_users[row["user_id"]] = {"user_id": row["user_id"], "display_name": row["display_name"]}
-    nurse_registration_open = bool(settings.get("nurse_registration_open", False))
-    safety_registration_open = bool(settings.get("safety_registration_open", False))
-
     active_incidents.clear()
+    by_id = {}
     for row in incidents:
-        active_incidents[row["group_id"]] = {
-            "id": row["incident_id"], "location": row["location"],
-            "initiator": row["initiator"], "initiator_name": row["initiator_name"],
-            "created_at": row["created_at"], "responses": {},
+        inc = {
+            "id": row["incident_id"],
+            "group_id": row["group_id"],
+            "initial_location": row["location"],
+            "location": row["location"],
+            "initiator": row["initiator"],
+            "initiator_name": row["initiator_name"],
+            "created_at": row["created_at"],
+            "responses": [],
+            "location_logs": [],
         }
+        active_incidents[row["group_id"]] = inc
+        by_id[row["incident_id"]] = inc
+
+    for row in loc_logs:
+        inc = by_id.get(row["incident_id"])
+        if inc:
+            if not inc["location_logs"]:
+                inc["initial_location"] = row["old_location"]
+            inc["location_logs"].append({
+                "seq": row["log_seq"],
+                "old_location": row["old_location"],
+                "new_location": row["new_location"],
+                "updated_by": row["updated_by"],
+                "updated_by_name": row["updated_by_name"],
+                "updated_at": row["updated_at"],
+            })
+
     for row in responses:
-        incident = next((item for item in active_incidents.values() if item["id"] == row["incident_id"]), None)
-        if incident:
-            incident["responses"][row["user_id"]] = {
-                "role": row["role"], "status": row["status"],
-                "time": row["responded_at"], "display_name": row["display_name"],
-            }
+        inc = by_id.get(row["incident_id"])
+        if inc:
+            inc["responses"].append({
+                "seq": row["response_seq"],
+                "user_id": row["user_id"],
+                "display_name": row["display_name"],
+                "status": row["status"],
+                "action_type": row["action_type"],
+                "time": row["responded_at"],
+            })
 
 
 def now_tw():
@@ -286,13 +362,35 @@ def next_incident_id():
 
 
 def time_text(value):
+    if value is None:
+        return "尚未結束"
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
     return value.astimezone(TAIWAN_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
 
+def duration_text(start_at, end_at):
+    if not start_at or not end_at:
+        return "計算中"
+    if start_at.tzinfo is None:
+        start_at = start_at.replace(tzinfo=timezone.utc)
+    if end_at.tzinfo is None:
+        end_at = end_at.replace(tzinfo=timezone.utc)
+    total_sec = max(0, int((end_at - start_at).total_seconds()))
+    hours, rem = divmod(total_sec, 3600)
+    minutes, seconds = divmod(rem, 60)
+    if hours > 0:
+        return f"{hours} 小時 {minutes} 分 {seconds} 秒"
+    return f"{minutes} 分 {seconds} 秒"
+
+
+def get_source_type(event):
+    return getattr(getattr(event, "source", None), "type", None)
+
+
 def get_group_id(event):
-    source = getattr(event, "source", None)
-    if getattr(source, "type", None) == "group":
-        return getattr(source, "group_id", None)
+    if get_source_type(event) == "group":
+        return getattr(event.source, "group_id", None)
     return None
 
 
@@ -301,14 +399,17 @@ def get_user_id(event):
 
 
 def get_display_name(group_id, user_id):
-    if not group_id or not user_id:
+    if not user_id:
         return "群組成員"
+    if group_id:
+        try:
+            return line_bot_api.get_group_member_profile(group_id, user_id).display_name
+        except Exception:
+            pass
     try:
-        return line_bot_api.get_group_member_profile(
-            group_id, user_id
-        ).display_name
+        return line_bot_api.get_profile(user_id).display_name
     except Exception:
-        return "群組成員"
+        return "LINE使用者"
 
 
 def is_admin(user_id):
@@ -316,68 +417,8 @@ def is_admin(user_id):
     return bool(user_id) and user_id == ADMIN_USER_ID
 
 
-def get_group_nurses(group_id=None):
-    """取得全域護理人員名單，依護理人員 1、2、3 排序。"""
-    return [
-        (slot, nurse_users[slot])
-        for slot in (1, 2, 3)
-        if slot in nurse_users
-    ]
-
-
-def get_next_nurse_slot():
-    """回傳第一個空缺名額；沒有空缺時回傳 None。"""
-    for slot in (1, 2, 3):
-        if slot not in nurse_users:
-            return slot
-    return None
-
-
-def is_nurse(user_id):
-    return any(record.get("user_id") == user_id for record in nurse_users.values())
-
-
-def is_safety_staff(user_id):
-    return bool(user_id) and user_id in safety_users
-
-
-def get_response_role(user_id):
-    """護理人員優先；同時具兩種資格者只視為護理人員。"""
-    if is_nurse(user_id):
-        return "nurse"
-    if is_safety_staff(user_id):
-        return "safety"
-    return None
-
-
-def nurse_registration_status_text():
-    lines = ["📋【護理人員登記狀況】"]
-    for slot in (1, 2, 3):
-        record = nurse_users.get(slot)
-        lines.append(
-            f"護理人員{slot}：{record.get('display_name') or '已登記'}"
-            if record else f"護理人員{slot}：尚未登記"
-        )
-    lines.append("登記模式：開啟" if nurse_registration_open else "登記模式：關閉")
-    if nurse_registration_open:
-        next_slot = get_next_nurse_slot()
-        lines.append(f"下一個登記名額：護理人員{next_slot}" if next_slot else "三名額滿")
-    return "\n".join(lines)
-
-
-def safety_registration_status_text():
-    lines = ["📋【工安人員登記狀況】", f"已登記人數：{len(safety_users)} 人"]
-    lines.append("登記模式：開啟" if safety_registration_open else "登記模式：關閉")
-    if safety_users:
-        for index, record in enumerate(safety_users.values(), 1):
-            lines.append(f"{index}. {record.get('display_name') or '工安人員'}")
-    else:
-        lines.append("目前尚無登記人員")
-    return "\n".join(lines)
-
-
 # ============================================================
-# 一般等待逾時處理
+# 一般等待逾時處理（5 分鐘未輸入地點自動取消）
 # ============================================================
 def schedule_timeout(kind, group_id, created_at):
     key = (kind, group_id)
@@ -390,12 +431,7 @@ def schedule_timeout(kind, group_id, created_at):
         try:
             await asyncio.sleep(WAIT_SECONDS)
 
-            current = (
-                pending_locations
-                if kind == "location"
-                else pending_corrections
-            )
-
+            current = pending_locations if kind == "location" else pending_corrections
             item = current.get(group_id)
 
             if item and item["created_at"] == created_at:
@@ -411,7 +447,7 @@ def schedule_timeout(kind, group_id, created_at):
                                     "⌛ 已超過 5 分鐘未收到事故地點，"
                                     "緊急救護啟動流程已自動取消。"
                                 )
-                            )
+                            ),
                         )
                     else:
                         line_bot_api.push_message(
@@ -421,7 +457,7 @@ def schedule_timeout(kind, group_id, created_at):
                                     "⌛ 已超過 5 分鐘未收到新的事故地點，"
                                     "本次修正已自動取消，維持原事故地點。"
                                 )
-                            )
+                            ),
                         )
                 except Exception as error:
                     print(f"等待流程逾時通知失敗：{error}")
@@ -436,12 +472,7 @@ def schedule_timeout(kind, group_id, created_at):
 
 
 def expire_if_needed(kind, group_id):
-    current = (
-        pending_locations
-        if kind == "location"
-        else pending_corrections
-    )
-
+    current = pending_locations if kind == "location" else pending_corrections
     item = current.get(group_id)
 
     if not item:
@@ -449,12 +480,9 @@ def expire_if_needed(kind, group_id):
 
     if (now_tw() - item["created_at"]).total_seconds() >= WAIT_SECONDS:
         current.pop(group_id, None)
-
         task = timeout_tasks.pop((kind, group_id), None)
-
         if task and not task.done():
             task.cancel()
-
         return True
 
     return False
@@ -464,10 +492,7 @@ def expire_if_needed(kind, group_id):
 # LINE 訊息工具
 # ============================================================
 def flex_message(alt_text, contents):
-    return FlexSendMessage(
-        alt_text=alt_text,
-        contents=contents
-    )
+    return FlexSendMessage(alt_text=alt_text, contents=contents)
 
 
 def postback(label, data, display_text=None):
@@ -479,10 +504,9 @@ def postback(label, data, display_text=None):
     }
 
 
-def panel_message():
+def ask_location_message():
     contents = {
         "type": "bubble",
-        "size": "kilo",
         "body": {
             "type": "box",
             "layout": "vertical",
@@ -490,127 +514,31 @@ def panel_message():
             "contents": [
                 {
                     "type": "text",
-                    "text": "廠區緊急救護面板",
+                    "text": "🚨 請在群組輸入事故地點",
                     "weight": "bold",
-                    "size": "lg"
-                },
-                {
-                    "type": "text",
-                    "text": "發生緊急狀況時，請點選下方按鈕啟動救護通知。",
-                    "wrap": True,
-                    "size": "sm",
-                    "color": "#666666"
-                },
-                {
-                    "type": "button",
-                    "style": "primary",
+                    "size": "lg",
                     "color": "#D93025",
-                    "height": "md",
-                    "action": postback(
-                        "🚨 緊急救護",
-                        "action=start_emergency"
-                    )
-                }
-            ]
-        }
-    }
-
-    return flex_message("廠區緊急救護面板", contents)
-
-
-def registration_prompt_message(role):
-    if role == "nurse":
-        title = "護理人員登記"
-        description = "目前開放護理人員登記，名額依序安排護理人員1、2、3。登記後立即生效。"
-        label = "我要登記為護理人員"
-        action = "register_nurse"
-    else:
-        title = "工安人員登記"
-        description = "目前開放工安人員登記。登記後立即生效，僅限實際工安人員操作。"
-        label = "我要登記為工安人員"
-        action = "register_safety"
-    contents = {
-        "type": "bubble",
-        "body": {"type": "box", "layout": "vertical", "spacing": "md", "contents": [
-            {"type": "text", "text": title, "weight": "bold", "size": "lg"},
-            {"type": "text", "text": description, "wrap": True, "size": "sm"},
-            {"type": "button", "style": "primary", "height": "md", "action": postback(label, f"action={action}")}
-        ]}
-    }
-    return flex_message(title, contents)
-
-
-def admin_roster_message():
-    contents = [
-        {"type": "text", "text": "人員登記管理", "weight": "bold", "size": "lg"},
-        {"type": "text", "text": "最高管理者專用；護理人員與工安人員名單全域共用。", "wrap": True, "size": "xs", "color": "#666666"},
-        {"type": "separator", "margin": "md"},
-        {"type": "text", "text": "護理人員登記：" + ("開啟" if nurse_registration_open else "關閉"), "weight": "bold", "size": "sm"},
-        {"type": "button", "style": "primary", "action": postback("開啟護理人員登記", "action=admin_nurse_open")},
-        {"type": "button", "style": "secondary", "action": postback("關閉護理人員登記", "action=admin_nurse_close")},
-        {"type": "text", "text": "工安人員登記：" + ("開啟" if safety_registration_open else "關閉"), "weight": "bold", "size": "sm", "margin": "md"},
-        {"type": "button", "style": "primary", "action": postback("開啟工安人員登記", "action=admin_safety_open")},
-        {"type": "button", "style": "secondary", "action": postback("關閉工安人員登記", "action=admin_safety_close")},
-        {"type": "separator", "margin": "md"},
-        {"type": "text", "text": "護理人員名單", "weight": "bold", "size": "sm"},
-    ]
-    for slot in (1, 2, 3):
-        rec = nurse_users.get(slot)
-        label = f"護理人員{slot}：{rec.get('display_name')}" if rec else f"護理人員{slot}：尚未登記"
-        contents.append({"type": "text", "text": label, "size": "sm", "wrap": True})
-        if rec:
-            contents.append({"type": "button", "style": "secondary", "height": "sm", "action": postback(f"刪除護理人員{slot}", f"action=admin_delete_nurse&slot={slot}")})
-    contents.extend([
-        {"type": "separator", "margin": "md"},
-        {"type": "text", "text": f"工安人員名單（{len(safety_users)}人）", "weight": "bold", "size": "sm"},
-    ])
-    for index, (uid, rec) in enumerate(safety_users.items()):
-        if index >= 10:
-            contents.append({"type": "text", "text": "其餘工安人員請使用「查詢工安人員」及「刪除工安人員 顯示名稱」指令管理。", "size": "xs", "wrap": True, "color": "#666666"})
-            break
-        contents.append({"type": "text", "text": rec.get("display_name") or "工安人員", "size": "sm", "wrap": True})
-        contents.append({"type": "button", "style": "secondary", "height": "sm", "action": postback("刪除此工安人員", f"action=admin_delete_safety&target={uid}")})
-    contents.append({"type": "button", "style": "secondary", "action": postback("重新整理名單", "action=admin_roster")})
-    return flex_message("人員登記管理", {"type": "bubble", "body": {"type": "box", "layout": "vertical", "spacing": "sm", "contents": contents}})
-
-
-def cancel_start_message():
-    contents = {
-        "type": "bubble",
-        "body": {
-            "type": "box",
-            "layout": "vertical",
-            "spacing": "md",
-            "contents": [
-                {
-                    "type": "text",
-                    "text": "請在群組輸入事故地點",
-                    "weight": "bold",
-                    "size": "lg"
                 },
                 {
                     "type": "text",
                     "text": (
-                        "任何群組成員皆可輸入。收到第一筆有效地點文字後，"
-                        "將立即發送緊急救護通知。等待時間為 5 分鐘。"
+                        "任何群組成員皆可直接輸入事故地點。"
+                        "收到第一筆有效地點文字後，將立即啟動救護事件並通知全體成員（@All）。"
+                        "等待時間為 5 分鐘。"
                     ),
                     "wrap": True,
-                    "size": "sm"
+                    "size": "sm",
                 },
                 {
                     "type": "button",
                     "style": "secondary",
                     "height": "sm",
-                    "action": postback(
-                        "取消啟動",
-                        "action=cancel_start"
-                    )
-                }
-            ]
-        }
+                    "action": postback("取消啟動", "action=cancel_start"),
+                },
+            ],
+        },
     }
-
-    return flex_message("請輸入事故地點或取消啟動", contents)
+    return flex_message("請在群組輸入事故地點", contents)
 
 
 def cancel_correction_message():
@@ -625,144 +553,108 @@ def cancel_correction_message():
                     "type": "text",
                     "text": "請輸入新的事故地點",
                     "weight": "bold",
-                    "size": "lg"
+                    "size": "lg",
                 },
                 {
                     "type": "text",
                     "text": (
                         "任何群組成員皆可提供新地點；"
-                        "5 分鐘內未收到內容將自動取消。"
+                        "系統將完整保留修改紀錄。5 分鐘內未收到內容將自動取消。"
                     ),
                     "wrap": True,
-                    "size": "sm"
+                    "size": "sm",
                 },
                 {
                     "type": "button",
                     "style": "secondary",
                     "height": "sm",
-                    "action": postback(
-                        "取消修正",
-                        "action=cancel_correction"
-                    )
-                }
-            ]
-        }
+                    "action": postback("取消修正", "action=cancel_correction"),
+                },
+            ],
+        },
     }
-
     return flex_message("請輸入新事故地點或取消修正", contents)
 
 
 def response_message_contents(incident_id):
-    """同一張 Flex 卡片分成護理人員及工安人員兩個獨立回報區。"""
-    def response_buttons(role, available_label, unavailable_label):
-        return [
-            {
-                "type": "button", "style": "primary", "color": "#16834A",
-                "height": "md",
-                "action": postback(
-                    available_label,
-                    f"action=ack_{role}_available&incident_id={incident_id}"
-                )
-            },
-            {
-                "type": "button", "style": "primary", "color": "#B3261E",
-                "height": "md",
-                "action": postback(
-                    unavailable_label,
-                    f"action=ack_{role}_unavailable&incident_id={incident_id}"
-                )
-            },
-        ]
-
+    """全體群組成員共用回報卡片；支援首次回報及後續變更狀態。"""
     contents = [
-        {"type": "text", "text": "救護人員回報", "weight": "bold", "size": "lg"},
-        {"type": "text", "text": "請依登記身分選擇專屬回報區；每人僅記錄第一次回報。", "wrap": True, "size": "sm"},
-        {"type": "separator", "margin": "md"},
-        {"type": "text", "text": "護理人員回報（已登記護理人員專用）", "weight": "bold", "size": "md", "color": "#16834A"},
+        {"type": "text", "text": "救護支援回報", "weight": "bold", "size": "lg"},
+        {
+            "type": "text",
+            "text": "所有群組成員皆可點擊回報；若狀況異動可再次點擊更新，系統將完整保留每次紀錄。",
+            "wrap": True,
+            "size": "sm",
+            "color": "#555555",
+        },
+        {
+            "type": "button",
+            "style": "primary",
+            "color": "#16834A",
+            "height": "md",
+            "action": postback(
+                "收到，可以前往",
+                f"action=ack_available&incident_id={incident_id}",
+            ),
+        },
+        {
+            "type": "button",
+            "style": "primary",
+            "color": "#B3261E",
+            "height": "md",
+            "action": postback(
+                "收到，但無法前往",
+                f"action=ack_unavailable&incident_id={incident_id}",
+            ),
+        },
     ]
-    contents.extend(response_buttons("nurse", "收到，可以前往", "收到，但無法前往"))
-    contents.extend([
-        {"type": "separator", "margin": "md"},
-        {"type": "text", "text": "工安人員回報（已登記工安人員專用）", "weight": "bold", "size": "md", "color": "#2563EB"},
-    ])
-    contents.extend(response_buttons("safety", "收到，可以前往支援", "收到，但無法前往支援"))
     return {
         "type": "bubble",
-        "body": {"type": "box", "layout": "vertical", "spacing": "md", "contents": contents}
+        "body": {
+            "type": "box",
+            "layout": "vertical",
+            "spacing": "md",
+            "contents": contents,
+        },
     }
 
 
 def response_message(incident_id):
-    return flex_message(
-        "請回報是否可以前往支援",
-        response_message_contents(incident_id)
-    )
+    return flex_message("請回報是否可以前往支援", response_message_contents(incident_id))
 
 
 # ============================================================
-# LINE 群組真正的 @All 通知
+# LINE 群組真正的 @All 通知（沿用已測試成功之 textV2 機制）
 # ============================================================
 def reply_emergency_notice(reply_token, notice, incident_id, group_id):
     """
-    優先以 Reply 發送真正 @All、群組內已登記護理人員 Mention 及回報卡片。
-    先確認護理人員確實屬於本次事件群組，避免跨群組 Mention 導致整筆訊息 HTTP 400。
+    優先以 Reply 發送真正 @All 及回報卡片。
     Reply 失敗後改用 Push 補送，絕不重複使用同一個 reply_token。
     """
     substitutions = {
         "everyone": {
             "type": "mention",
-            "mentionee": {"type": "all"}
+            "mentionee": {"type": "all"},
         }
     }
 
-    mention_tokens = []
-    for slot, record in get_group_nurses():
-        user_id = record.get("user_id")
-        if not user_id:
-            continue
-
-        # 全域名單不代表每位人員都是本次事件群組的成員。
-        # 只有確認屬於目前群組，才加入 Mention，避免 LINE API 拒絕整筆訊息。
-        try:
-            line_bot_api.get_group_member_profile(group_id, user_id)
-        except Exception as member_error:
-            print(
-                f"本群組未能確認護理人員 {record.get('display_name') or user_id} "
-                f"為群組成員，略過該員 Mention：{member_error}"
-            )
-            continue
-
-        token_name = f"nurse{slot}"
-        mention_tokens.append("{" + token_name + "}")
-        substitutions[token_name] = {
-            "type": "mention",
-            "mentionee": {
-                "type": "user",
-                "userId": user_id
-            }
-        }
-
-    mention_line = " ".join(mention_tokens)
-    text_v2 = "{everyone}\n"
-    if mention_line:
-        text_v2 += mention_line + "\n"
-    text_v2 += notice
-
+    text_v2 = "{everyone}\n" + notice
     flex_contents = response_message_contents(incident_id)
+
     reply_payload = {
         "replyToken": reply_token,
         "messages": [
             {
                 "type": "textV2",
                 "text": text_v2,
-                "substitution": substitutions
+                "substitution": substitutions,
             },
             {
                 "type": "flex",
                 "altText": "請回報是否可以前往支援",
-                "contents": flex_contents
-            }
-        ]
+                "contents": flex_contents,
+            },
+        ],
     }
 
     reply_request = urllib.request.Request(
@@ -770,23 +662,18 @@ def reply_emergency_notice(reply_token, notice, incident_id, group_id):
         data=json.dumps(reply_payload, ensure_ascii=False).encode("utf-8"),
         headers={
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}"
+            "Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}",
         },
-        method="POST"
+        method="POST",
     )
 
     try:
         with urllib.request.urlopen(reply_request, timeout=10) as response:
             response.read()
-
-        print(
-            "緊急救護通知已發送：真正的 @All，"
-            f"並 Mention 本群組內 {len(mention_tokens)} 名已登記護理人員。"
-        )
+        print(f"緊急救護通知已發送（Reply @All）：事件編號 {incident_id}")
         return
 
     except Exception as error:
-        # 記錄 LINE 回傳的 HTTP 狀態及錯誤本文，方便追查真正原因。
         error_body = ""
         if hasattr(error, "read"):
             try:
@@ -799,8 +686,7 @@ def reply_emergency_notice(reply_token, notice, incident_id, group_id):
             f"錯誤內容：{error_body or str(error)}"
         )
 
-    # Reply Token 僅能使用一次；第一次 Reply 失敗後，不可再次拿它呼叫 reply_message。
-    # 改用 Push API 發送 @All 及回報卡片，不依賴原 reply_token。
+    # Reply 失敗後改用 Push API 發送 @All 及回報卡片
     push_payload = {
         "to": group_id,
         "messages": [
@@ -810,16 +696,16 @@ def reply_emergency_notice(reply_token, notice, incident_id, group_id):
                 "substitution": {
                     "everyone": {
                         "type": "mention",
-                        "mentionee": {"type": "all"}
+                        "mentionee": {"type": "all"},
                     }
-                }
+                },
             },
             {
                 "type": "flex",
                 "altText": "請回報是否可以前往支援",
-                "contents": flex_contents
-            }
-        ]
+                "contents": flex_contents,
+            },
+        ],
     }
 
     push_request = urllib.request.Request(
@@ -827,15 +713,15 @@ def reply_emergency_notice(reply_token, notice, incident_id, group_id):
         data=json.dumps(push_payload, ensure_ascii=False).encode("utf-8"),
         headers={
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}"
+            "Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}",
         },
-        method="POST"
+        method="POST",
     )
 
     try:
         with urllib.request.urlopen(push_request, timeout=10) as response:
             response.read()
-        print("緊急救護通知已改用 Push API 補送：@All 及回報卡片。")
+        print(f"緊急救護通知已改用 Push API 補送（@All）：事件編號 {incident_id}")
         return
 
     except Exception as push_error:
@@ -851,14 +737,14 @@ def reply_emergency_notice(reply_token, notice, incident_id, group_id):
             f"錯誤內容：{push_body or str(push_error)}"
         )
 
-    # 最後一道保底：即使 @All 格式也失敗，仍嘗試送出一般群組通知及回報卡片。
+    # 最後一道保底：送出一般群組通知及回報卡片
     try:
         line_bot_api.push_message(
             group_id,
             [
                 TextSendMessage(text=notice),
-                response_message(incident_id)
-            ]
+                response_message(incident_id),
+            ],
         )
         print("一般緊急救護通知及回報卡片已透過 Push API 補送。")
     except Exception as fallback_error:
@@ -866,141 +752,166 @@ def reply_emergency_notice(reply_token, notice, incident_id, group_id):
 
 
 # ============================================================
-# 新增：指定原始啟動人員 @Mention 通知
+# 救護事件狀態統計與完整結案報告
 # ============================================================
-def push_initiator_mention(group_id, user_id, message, display_name):
+def summarize_latest_responses(responses):
     """
-    在原救護事件群組中，真正 @ 指定的原始啟動人員。
-    不使用 @All。
+    依時間順序彙整每位成員的最新狀態，同時保留完整歷程筆數。
+    responses 必須已依 seq / 時間由舊到新排序。
     """
-    payload = {
-        "to": group_id,
-        "messages": [
-            {
-                "type": "textV2",
-                "text": "{initiator}\n" + message,
-                "substitution": {
-                    "initiator": {
-                        "type": "mention",
-                        "mentionee": {
-                            "type": "user",
-                            "userId": user_id
-                        }
-                    }
-                }
-            }
-        ]
-    }
+    latest_by_user = {}
+    for rec in responses:
+        latest_by_user[rec["user_id"]] = rec
 
-    request = urllib.request.Request(
-        "https://api.line.me/v2/bot/message/push",
-        data=json.dumps(
-            payload,
-            ensure_ascii=False
-        ).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}"
-        },
-        method="POST"
+    available = []
+    unavailable = []
+    for rec in latest_by_user.values():
+        name = rec.get("display_name") or "群組成員"
+        entry = f"{name}（{time_text(rec['time'])}）"
+        if rec["status"] == "available":
+            available.append(entry)
+        else:
+            unavailable.append(entry)
+
+    return latest_by_user, available, unavailable
+
+
+def incident_status_text(incident, include_unavailable=False):
+    """進行中即時回報狀況摘要。"""
+    latest_by_user, available, unavailable = summarize_latest_responses(incident["responses"])
+    total_records = len(incident["responses"])
+
+    lines = [
+        "📋【緊急救護即時回報狀況】",
+        f"事件編號：{incident['id']}",
+        f"啟動時間：{time_text(incident['created_at'])}",
+        f"啟動人員：{incident['initiator_name']}",
+        f"目前事故地點：{incident['location']}",
+        f"已回報人數：{len(latest_by_user)} 人（累計回報/修改 {total_records} 筆）",
+        f"可以前往：{len(available)} 人",
+        "可以前往名單：" + ("、".join(available) or "目前無"),
+    ]
+    if include_unavailable:
+        lines.extend([
+            f"無法前往：{len(unavailable)} 人",
+            "無法前往名單：" + ("、".join(unavailable) or "目前無"),
+        ])
+
+    return "\n".join(lines)
+
+
+def build_final_incident_report(incident, close_reason_label, ended_at=None):
+    """產出包含地點修改歷程、最新統計與完整人員回應/修改時間軸的事件報告。"""
+    ended_at = ended_at or incident.get("ended_at") or now_tw()
+    created_at = incident["created_at"]
+    latest_by_user, available, unavailable = summarize_latest_responses(incident["responses"])
+    location_logs = incident.get("location_logs", [])
+    initial_location = incident.get("initial_location") or (
+        location_logs[0]["old_location"] if location_logs else incident["location"]
     )
 
-    try:
-        with urllib.request.urlopen(request, timeout=10) as response:
-            response.read()
+    lines = [
+        "📑【緊急救護事件完整結案報告】",
+        f"事件編號：{incident['id']}",
+        f"結案方式：{close_reason_label}",
+        f"啟動人員：{incident['initiator_name']}",
+        f"啟動時間：{time_text(created_at)}",
+        f"結束時間：{time_text(ended_at)}",
+        f"事件總歷時：{duration_text(created_at, ended_at)}",
+        f"初始事故地點：{initial_location}",
+        f"最終事故地點：{incident['location']}",
+        "",
+        f"【地點修改紀錄（共 {len(location_logs)} 次）】",
+    ]
 
-        print(
-            f"救護事件1小時提醒已發送，"
-            f"指定人員：{display_name}"
-        )
-
-    except Exception as error:
-        print(f"指定人員 @Mention 發送失敗：{error}")
-
-        # API 失敗時，至少補送一般群組文字通知
-        try:
-            line_bot_api.push_message(
-                group_id,
-                TextSendMessage(
-                    text=(
-                        f"🔔 {display_name}，救護事件尚未結束，"
-                        "請確認目前處理進度。"
-                    )
-                )
+    if location_logs:
+        for idx, log in enumerate(location_logs, 1):
+            lines.append(
+                f"{idx}. {time_text(log['updated_at'])}｜{log['updated_by_name']}："
+                f"「{log['old_location']}」→「{log['new_location']}」"
             )
-        except Exception as fallback_error:
-            print(f"1小時提醒補送失敗：{fallback_error}")
+    else:
+        lines.append("無地點修改紀錄")
+
+    lines.extend([
+        "",
+        "【最終人員支援統計（依每人最新狀態）】",
+        f"參與回報總人數：{len(latest_by_user)} 人（總紀錄 {len(incident['responses'])} 筆）",
+        f"可以前往（{len(available)} 人）：" + ("、".join(available) or "無"),
+        f"無法前往（{len(unavailable)} 人）：" + ("、".join(unavailable) or "無"),
+        "",
+        f"【完整回應與修改時間軸（共 {len(incident['responses'])} 筆）】",
+    ])
+
+    if incident["responses"]:
+        for idx, rec in enumerate(incident["responses"], 1):
+            action_label = "首次回報" if rec.get("action_type") == "initial" else "修改狀態"
+            status_label = "可以前往" if rec["status"] == "available" else "無法前往"
+            lines.append(
+                f"{idx}. {time_text(rec['time'])}｜{rec.get('display_name') or '群組成員'}"
+                f"【{action_label}】→ {status_label}"
+            )
+    else:
+        lines.append("本次事件無人員點擊回報")
+
+    return "\n".join(lines)
 
 
 # ============================================================
-# 新增：救護事件定時提醒及自動結束
+# 救護事件定時自動結束（啟動滿 1 小時自動結束）
 # ============================================================
 def cancel_incident_timer(group_id):
     """取消指定群組目前的救護事件計時任務。"""
     task = incident_timer_tasks.pop(group_id, None)
-
     if task and not task.done():
         task.cancel()
         print(f"已取消群組 {group_id} 的救護事件計時任務。")
 
 
 def schedule_incident_timer(group_id, incident):
-    """依事件原始建立時間計算1小時提醒及2小時自動結束，不因重啟而重設。"""
+    """依事件原始建立時間計算滿 1 小時自動結束，不因重啟而重設。"""
     cancel_incident_timer(group_id)
     incident_id = incident["id"]
-    initiator = incident["initiator"]
-    initiator_name = incident["initiator_name"]
     created_at = incident["created_at"]
     if created_at.tzinfo is None:
         created_at = created_at.replace(tzinfo=timezone.utc)
 
-    async def wait_and_process():
+    async def wait_and_auto_close():
         try:
             elapsed = (now_tw() - created_at.astimezone(TAIWAN_TZ)).total_seconds()
-            reminder_wait = max(0, INCIDENT_REMINDER_SECONDS - elapsed)
-            await asyncio.sleep(reminder_wait)
+            wait_seconds = max(0, INCIDENT_AUTO_CLOSE_SECONDS - elapsed)
+            await asyncio.sleep(wait_seconds)
 
             current = active_incidents.get(group_id)
             if not current or current["id"] != incident_id:
                 return
 
+            # 再次確認已滿 1 小時
             elapsed = (now_tw() - created_at.astimezone(TAIWAN_TZ)).total_seconds()
-            if elapsed < INCIDENT_REMINDER_SECONDS:
-                await asyncio.sleep(INCIDENT_REMINDER_SECONDS - elapsed)
+            if elapsed < INCIDENT_AUTO_CLOSE_SECONDS:
+                await asyncio.sleep(INCIDENT_AUTO_CLOSE_SECONDS - elapsed)
                 current = active_incidents.get(group_id)
                 if not current or current["id"] != incident_id:
                     return
 
-            reminder_text = (
-                "⏰【救護事件尚未結束提醒】\n"
-                f"事件編號：{incident_id}\n"
-                f"事故地點：{current['location']}\n"
-                "本救護事件已啟動1小時，目前仍未結束，"
-                "請確認處理進度，並於完成後執行結束操作。"
-            )
-            push_initiator_mention(group_id, initiator, reminder_text, initiator_name)
-
-            elapsed = (now_tw() - created_at.astimezone(TAIWAN_TZ)).total_seconds()
-            await asyncio.sleep(max(0, INCIDENT_REMINDER_SECONDS + INCIDENT_AUTO_CLOSE_SECONDS - elapsed))
-
-            current = active_incidents.get(group_id)
-            if not current or current["id"] != incident_id:
-                return
-
-            # 先寫入資料庫，成功後才從記憶體移除。
-            if close_incident_record(incident_id, "auto_closed"):
+            ended_at = now_tw()
+            if close_incident_record(incident_id, "auto_closed", ended_at=ended_at):
                 active_incidents.pop(group_id, None)
                 pending_closures.pop(group_id, None)
-                auto_close_text = (
-                    "⏰【救護事件自動結束公告】\n"
-                    f"{incident_status_text(current, include_unavailable=True)}\n"
-                    "本救護事件啟動已滿2小時，"
-                    "因尚未執行人工結束操作，系統已自動結束本次事件。\n"
-                    "如仍有救護需求，請重新啟動緊急救護流程。"
+                report_text = build_final_incident_report(
+                    current,
+                    close_reason_label="啟動滿 1 小時系統自動結束",
+                    ended_at=ended_at,
+                )
+                auto_close_msg = (
+                    "⏰【救護事件已滿 1 小時自動結束】\n"
+                    "本救護事件啟動已滿 1 小時，系統已自動結束本次事件並封存紀錄。\n"
+                    "如仍有救護需求，請重新輸入 119 啟動。\n\n"
+                    f"{report_text}"
                 )
                 try:
-                    line_bot_api.push_message(group_id, TextSendMessage(text=auto_close_text))
-                    print(f"救護事件已自動結束：{incident_id}")
+                    line_bot_api.push_message(group_id, TextSendMessage(text=auto_close_msg))
+                    print(f"救護事件滿 1 小時已自動結束：{incident_id}")
                 except Exception as error:
                     print(f"自動結束群組公告發送失敗：{error}")
 
@@ -1014,14 +925,16 @@ def schedule_incident_timer(group_id, incident):
             if incident_timer_tasks.get(group_id) is current_task:
                 incident_timer_tasks.pop(group_id, None)
 
-    incident_timer_tasks[group_id] = asyncio.create_task(wait_and_process())
-    print(f"已建立救護事件計時任務：{incident_id}，依原始啟動時間計算1小時提醒、2小時自動結束。")
+    incident_timer_tasks[group_id] = asyncio.create_task(wait_and_auto_close())
+    print(f"已建立救護事件計時任務：{incident_id}，將於啟動滿 1 小時後自動結束。")
 
 
 # ============================================================
-# 救護事件結束確認
+# 救護事件結束確認卡片
 # ============================================================
-def close_confirmation_message(incident_id, status_text):
+def close_confirmation_message(incident_id, status_text, action_prefix=""):
+    confirm_action = f"{action_prefix}confirm_close"
+    cancel_action = f"{action_prefix}cancel_close"
     contents = {
         "type": "bubble",
         "body": {
@@ -1031,15 +944,15 @@ def close_confirmation_message(incident_id, status_text):
             "contents": [
                 {
                     "type": "text",
-                    "text": "確認結束救護事件？",
+                    "text": f"確認結束救護事件（{incident_id}）？",
                     "weight": "bold",
-                    "size": "lg"
+                    "size": "lg",
                 },
                 {
                     "type": "text",
                     "text": status_text,
                     "wrap": True,
-                    "size": "sm"
+                    "size": "sm",
                 },
                 {
                     "type": "button",
@@ -1047,9 +960,9 @@ def close_confirmation_message(incident_id, status_text):
                     "color": "#D93025",
                     "height": "md",
                     "action": postback(
-                        "確認結束",
-                        f"action=confirm_close&incident_id={incident_id}"
-                    )
+                        "確認結束並產出報告",
+                        f"action={confirm_action}&incident_id={incident_id}",
+                    ),
                 },
                 {
                     "type": "button",
@@ -1057,67 +970,17 @@ def close_confirmation_message(incident_id, status_text):
                     "height": "md",
                     "action": postback(
                         "取消",
-                        f"action=cancel_close&incident_id={incident_id}"
-                    )
-                }
-            ]
-        }
+                        f"action={cancel_action}&incident_id={incident_id}",
+                    ),
+                },
+            ],
+        },
     }
-
     return flex_message("請確認是否結束救護事件", contents)
 
 
-def incident_status_text(incident, include_unavailable=False):
-    """護理人員與工安人員分開統計；進行中僅顯示可出動資訊，結束時顯示完整統計。"""
-    groups = {
-        "nurse": {"available": [], "unavailable": []},
-        "safety": {"available": [], "unavailable": []},
-    }
-    for record in incident["responses"].values():
-        role = record.get("role")
-        if role not in groups:
-            continue
-        name = record.get("display_name") or "群組成員"
-        entry = f"{name}｜{time_text(record['time'])}"
-        groups[role][record["status"]].append(entry)
-
-    lines = [
-        "📋【緊急救護即時回報狀況】",
-        f"事件編號：{incident['id']}",
-        f"事故地點：{incident['location']}",
-        "",
-        "【護理人員回報】",
-        f"已回報：{sum(len(v) for v in groups['nurse'].values())} 人",
-        f"可以前往：{len(groups['nurse']['available'])} 人",
-        "可以前往名單：" + ("、".join(groups['nurse']['available']) or "目前無"),
-    ]
-    if include_unavailable:
-        lines.extend([
-            f"無法前往：{len(groups['nurse']['unavailable'])} 人",
-            "無法前往名單：" + ("、".join(groups['nurse']['unavailable']) or "目前無"),
-        ])
-
-    lines.extend([
-        "",
-        "【工安人員回報】",
-        f"已回報：{sum(len(v) for v in groups['safety'].values())} 人",
-        f"可以前往：{len(groups['safety']['available'])} 人",
-        "可以前往名單：" + ("、".join(groups['safety']['available']) or "目前無"),
-    ])
-    if include_unavailable:
-        lines.extend([
-            f"無法前往：{len(groups['safety']['unavailable'])} 人",
-            "無法前往名單：" + ("、".join(groups['safety']['unavailable']) or "目前無"),
-        ])
-
-    return "\n".join(lines)
-
-
 def reply_text(reply_token, text):
-    line_bot_api.reply_message(
-        reply_token,
-        TextSendMessage(text=text)
-    )
+    line_bot_api.reply_message(reply_token, TextSendMessage(text=text))
 
 
 # ============================================================
@@ -1125,31 +988,31 @@ def reply_text(reply_token, text):
 # ============================================================
 @app.on_event("startup")
 async def startup_restore_state():
-    # 若 DATABASE_URL、資料庫連線或資料表初始化失敗，讓 Render 明確顯示啟動失敗。
     init_database()
     load_persistent_state()
-    print(
-        "PostgreSQL 已連線；已還原護理人員 "
-        f"{len(nurse_users)} 名、工安人員 {len(safety_users)} 名、"
-        f"進行中救護事件 {len(active_incidents)} 件。"
-    )
+    print(f"PostgreSQL 已連線；已還原進行中救護事件 {len(active_incidents)} 件。")
+
     for group_id, incident in list(active_incidents.items()):
         created_at = incident["created_at"]
         if created_at.tzinfo is None:
             created_at = created_at.replace(tzinfo=timezone.utc)
         elapsed = (now_tw() - created_at.astimezone(TAIWAN_TZ)).total_seconds()
-        total_seconds = INCIDENT_REMINDER_SECONDS + INCIDENT_AUTO_CLOSE_SECONDS
-        if elapsed >= total_seconds:
-            # 服務停機期間已超過2小時：直接結束，不補發過期的1小時提醒。
-            if close_incident_record(incident["id"], "auto_closed"):
+
+        if elapsed >= INCIDENT_AUTO_CLOSE_SECONDS:
+            ended_at = now_tw()
+            if close_incident_record(incident["id"], "auto_closed", ended_at=ended_at):
                 active_incidents.pop(group_id, None)
                 pending_closures.pop(group_id, None)
+                report_text = build_final_incident_report(
+                    incident,
+                    close_reason_label="啟動滿 1 小時系統自動結束（服務重啟結算）",
+                    ended_at=ended_at,
+                )
                 message = (
-                    "⏰【救護事件自動結束公告】\n"
-                    f"{incident_status_text(incident, include_unavailable=True)}\n"
-                    "本救護事件啟動已滿2小時，因服務重新啟動時已逾自動結束時間，"
-                    "系統已自動結束本次事件。\n"
-                    "如仍有救護需求，請重新啟動緊急救護流程。"
+                    "⏰【救護事件已滿 1 小時自動結束】\n"
+                    "本救護事件啟動已滿 1 小時，服務重啟檢查時已逾自動結束時間，"
+                    "系統已自動結束本次事件並封存紀錄。\n\n"
+                    f"{report_text}"
                 )
                 try:
                     line_bot_api.push_message(group_id, TextSendMessage(text=message))
@@ -1157,6 +1020,170 @@ async def startup_restore_state():
                     print(f"重啟後自動結束公告發送失敗：{error}")
         else:
             schedule_incident_timer(group_id, incident)
+
+
+# ============================================================
+# 最高管理者私訊專屬指令與按鈕處理
+# ============================================================
+def admin_help_text():
+    return (
+        "🛡️【最高管理者私訊指令說明】\n"
+        "1. 查詢進行中事件\n"
+        "   → 檢視目前所有進行中的救護事件與編號。\n"
+        "2. 查詢事件 事件編號（例如：查詢事件 2026112301）\n"
+        "   → 調閱指定事件（含已結案歷史資料）的完整事件報告。\n"
+        "3. 結束事件 事件編號（例如：結束事件 2026112301）\n"
+        "   → 人工強制結束指定進行中事件，並於原群組及私訊產出完整結案報告。"
+    )
+
+
+def handle_admin_private_postback(event, user_id, data):
+    if not is_admin(user_id):
+        reply_text(event.reply_token, "⛔ 此操作僅限最高管理者透過私人訊息執行。")
+        return
+
+    action = data.get("action", [""])[0]
+    incident_id = data.get("incident_id", [""])[0]
+
+    if action == "admin_confirm_close":
+        target_group_id = None
+        target_incident = None
+        for gid, inc in active_incidents.items():
+            if inc["id"] == incident_id:
+                target_group_id = gid
+                target_incident = inc
+                break
+
+        if not target_incident or not target_group_id:
+            admin_pending_closures.pop(incident_id, None)
+            reply_text(event.reply_token, f"⚠️ 事件 {incident_id} 已結束或不存在。")
+            return
+
+        ended_at = now_tw()
+        if not close_incident_record(incident_id, "admin_closed", ended_at=ended_at):
+            reply_text(event.reply_token, "資料庫未能確認事件結束，請稍後再試。")
+            return
+
+        cancel_incident_timer(target_group_id)
+        active_incidents.pop(target_group_id, None)
+        pending_closures.pop(target_group_id, None)
+        admin_pending_closures.pop(incident_id, None)
+
+        report_text = build_final_incident_report(
+            target_incident,
+            close_reason_label="最高管理者私訊結束",
+            ended_at=ended_at,
+        )
+
+        # 同步在原群組發布完整結案報告
+        try:
+            line_bot_api.push_message(
+                target_group_id,
+                TextSendMessage(
+                    text=f"✅ 最高管理者已結束本次救護事件。\n\n{report_text}"
+                ),
+            )
+        except Exception as error:
+            print(f"管理者結束事件後推播群組報告失敗：{error}")
+
+        reply_text(
+            event.reply_token,
+            f"✅ 已成功結束事件 {incident_id}，並已於原群組發布報告。\n\n{report_text}",
+        )
+
+    elif action == "admin_cancel_close":
+        admin_pending_closures.pop(incident_id, None)
+        reply_text(event.reply_token, f"已取消結束事件 {incident_id}，事件維持進行中。")
+
+
+def handle_admin_private_text(event, user_id, text):
+    if not is_admin(user_id):
+        reply_text(event.reply_token, "本功能僅供指定 LINE 群組使用。")
+        return
+
+    if text in ("管理說明", "指令", "幫助", "help", "Help"):
+        reply_text(event.reply_token, admin_help_text())
+        return
+
+    if text in ("查詢進行中事件", "查詢事件", "進行中事件"):
+        if not active_incidents:
+            reply_text(event.reply_token, "目前沒有任何進行中的救護事件。\n\n" + admin_help_text())
+            return
+
+        lines = [f"📋【目前進行中救護事件（共 {len(active_incidents)} 件）】"]
+        for idx, (gid, inc) in enumerate(active_incidents.items(), 1):
+            latest_by_user, available, _ = summarize_latest_responses(inc["responses"])
+            lines.extend([
+                f"\n{idx}. 事件編號：{inc['id']}",
+                f"   群組 ID：{gid}",
+                f"   啟動時間：{time_text(inc['created_at'])}",
+                f"   啟動人員：{inc['initiator_name']}",
+                f"   目前地點：{inc['location']}",
+                f"   回報狀況：已回報 {len(latest_by_user)} 人（可以前往 {len(available)} 人）",
+            ])
+        lines.append("\n輸入「結束事件 事件編號」可結束指定事件，或「查詢事件 事件編號」檢視完整紀錄。")
+        reply_text(event.reply_token, "\n".join(lines))
+        return
+
+    if text.startswith("查詢事件 "):
+        target_id = text.replace("查詢事件 ", "", 1).strip()
+        if not target_id:
+            reply_text(event.reply_token, "請輸入欲查詢的事件編號，例如：查詢事件 2026112301")
+            return
+
+        # 優先讀取記憶體進行中最新狀態，若已結束則從 PostgreSQL 讀取完整歷史資料
+        record = next((inc for inc in active_incidents.values() if inc["id"] == target_id), None)
+        if record:
+            report_text = build_final_incident_report(
+                record,
+                close_reason_label="進行中（即時預覽）",
+                ended_at=now_tw(),
+            )
+            reply_text(event.reply_token, report_text)
+            return
+
+        db_record = fetch_incident_full_data(target_id)
+        if not db_record:
+            reply_text(event.reply_token, f"找不到事件編號：{target_id}")
+            return
+
+        status_map = {
+            "active": "進行中",
+            "closed": "原發起人手動結束",
+            "auto_closed": "啟動滿 1 小時系統自動結束",
+            "admin_closed": "最高管理者私訊結束",
+        }
+        report_text = build_final_incident_report(
+            db_record,
+            close_reason_label=status_map.get(db_record["status"], db_record["status"]),
+            ended_at=db_record["ended_at"],
+        )
+        reply_text(event.reply_token, report_text)
+        return
+
+    if text.startswith("結束事件 "):
+        target_id = text.replace("結束事件 ", "", 1).strip()
+        if not target_id:
+            reply_text(event.reply_token, "請輸入欲結束的事件編號，例如：結束事件 2026112301")
+            return
+
+        target_incident = next((inc for inc in active_incidents.values() if inc["id"] == target_id), None)
+        if not target_incident:
+            reply_text(event.reply_token, f"⚠️ 找不到進行中的事件 {target_id}（可能已結束或編號錯誤）。")
+            return
+
+        admin_pending_closures[target_id] = {
+            "incident_id": target_id,
+            "requested_at": now_tw(),
+        }
+        status_summary = incident_status_text(target_incident, include_unavailable=True)
+        line_bot_api.reply_message(
+            event.reply_token,
+            close_confirmation_message(target_id, status_summary, action_prefix="admin_"),
+        )
+        return
+
+    reply_text(event.reply_token, admin_help_text())
 
 
 # ============================================================
@@ -1169,326 +1196,186 @@ def home():
 
 @app.post("/callback")
 async def callback(request: Request):
-    global nurse_registration_open, safety_registration_open
     signature = request.headers.get("X-Line-Signature", "")
     body = await request.body()
     body_text = body.decode("utf-8")
 
     try:
         events = parser.parse(body_text, signature)
-
     except InvalidSignatureError:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid signature."
-        )
+        raise HTTPException(status_code=400, detail="Invalid signature.")
 
     for event in events:
         group_id = get_group_id(event)
+        user_id = get_user_id(event)
 
         # ====================================================
-        # 加入群組時，自動發送緊急救護面板
+        # 加入群組時，發送使用提示
         # ====================================================
         if isinstance(event, JoinEvent) and group_id:
-            line_bot_api.reply_message(
+            reply_text(
                 event.reply_token,
-                panel_message()
+                "🚨 廠區緊急救護通知機器人已就緒。\n"
+                "發生緊急狀況時，請直接在群組輸入「119」，並依提示輸入事故地點即可立即啟動通知。",
             )
             continue
 
+        # ====================================================
+        # 非群組來源（私人訊息）：僅最高管理者可使用查詢與結束指令
+        # ====================================================
         if not group_id:
-            if (
-                isinstance(event, MessageEvent)
-                and isinstance(event.message, TextMessage)
-            ):
-                reply_text(
-                    event.reply_token,
-                    "本功能僅供指定 LINE 群組使用。"
-                )
+            if isinstance(event, PostbackEvent):
+                data = parse_qs(getattr(event.postback, "data", ""))
+                handle_admin_private_postback(event, user_id, data)
+            elif isinstance(event, MessageEvent) and isinstance(event.message, TextMessage):
+                handle_admin_private_text(event, user_id, event.message.text.strip())
             continue
 
         # ====================================================
-        # Postback 按鈕處理
+        # 群組 Postback 按鈕處理
         # ====================================================
         if isinstance(event, PostbackEvent):
-            data = parse_qs(
-                getattr(event.postback, "data", "")
-            )
-
+            data = parse_qs(getattr(event.postback, "data", ""))
             action = data.get("action", [""])[0]
-            user_id = get_user_id(event)
             incident_id = data.get("incident_id", [""])[0]
-
-            # ------------------------------------------------
-            # 最高管理者人員管理面板按鈕
-            # ------------------------------------------------
-            if action.startswith("admin_"):
-                if not is_admin(user_id):
-                    reply_text(event.reply_token, "⛔ 此操作僅限最高管理者執行。")
-                elif action == "admin_nurse_open":
-                    if get_next_nurse_slot() is None:
-                        reply_text(event.reply_token, "三名護理人員名額已滿。")
-                    else:
-                        nurse_registration_open = True
-                        set_app_setting("nurse_registration_open", True)
-                        line_bot_api.reply_message(event.reply_token, registration_prompt_message("nurse"))
-                elif action == "admin_nurse_close":
-                    nurse_registration_open = False
-                    set_app_setting("nurse_registration_open", False)
-                    line_bot_api.reply_message(event.reply_token, admin_roster_message())
-                elif action == "admin_safety_open":
-                    safety_registration_open = True
-                    set_app_setting("safety_registration_open", True)
-                    line_bot_api.reply_message(event.reply_token, registration_prompt_message("safety"))
-                elif action == "admin_safety_close":
-                    safety_registration_open = False
-                    set_app_setting("safety_registration_open", False)
-                    line_bot_api.reply_message(event.reply_token, admin_roster_message())
-                elif action == "admin_delete_nurse":
-                    try:
-                        slot = int(data.get("slot", ["0"])[0])
-                    except ValueError:
-                        slot = 0
-                    if slot in (1, 2, 3):
-                        delete_nurse_record(slot)
-                    removed = nurse_users.pop(slot, None) if slot in (1, 2, 3) else None
-                    line_bot_api.reply_message(event.reply_token, admin_roster_message())
-                elif action == "admin_delete_safety":
-                    target = data.get("target", [""])[0]
-                    delete_safety_record(target)
-                    safety_users.pop(target, None)
-                    line_bot_api.reply_message(event.reply_token, admin_roster_message())
-                elif action == "admin_roster":
-                    line_bot_api.reply_message(event.reply_token, admin_roster_message())
-                continue
-
-            # ------------------------------------------------
-            # 人員自行登記按鈕（開放時立即生效，不需核准）
-            # ------------------------------------------------
-            if action in ("register_nurse", "register_safety"):
-                if not user_id:
-                    reply_text(event.reply_token, "無法辨識你的 LINE 帳號，請確認以個人 LINE 帳號操作。")
-                elif action == "register_nurse":
-                    if not nurse_registration_open:
-                        reply_text(event.reply_token, "目前未開放護理人員登記。")
-                    elif is_nurse(user_id):
-                        slot = next(slot for slot, rec in nurse_users.items() if rec.get("user_id") == user_id)
-                        reply_text(event.reply_token, f"你已登記為護理人員{slot}，不需重複登記。")
-                    else:
-                        slot = get_next_nurse_slot()
-                        if slot is None:
-                            nurse_registration_open = False
-                            set_app_setting("nurse_registration_open", False)
-                            reply_text(event.reply_token, "三名護理人員名額已滿，登記已自動關閉。")
-                        else:
-                            display_name = get_display_name(group_id, user_id)
-                            new_record = {"user_id": user_id, "display_name": display_name}
-                            save_nurse_record(slot, new_record)
-                            nurse_users[slot] = new_record
-                            if get_next_nurse_slot() is None:
-                                nurse_registration_open = False
-                                set_app_setting("nurse_registration_open", False)
-                            reply_text(event.reply_token, f"✅ 護理人員{slot}登記成功！\n登記人員：{display_name}\n" + nurse_registration_status_text())
-                else:
-                    if not safety_registration_open:
-                        reply_text(event.reply_token, "目前未開放工安人員登記。")
-                    elif is_safety_staff(user_id):
-                        reply_text(event.reply_token, "你已登記為工安人員，不需重複登記。")
-                    else:
-                        display_name = get_display_name(group_id, user_id)
-                        new_record = {"user_id": user_id, "display_name": display_name}
-                        save_safety_record(user_id, new_record)
-                        safety_users[user_id] = new_record
-                        reply_text(event.reply_token, f"✅ 工安人員登記成功！\n登記人員：{display_name}\n" + safety_registration_status_text())
-                continue
-
-            # ------------------------------------------------
-            # 啟動緊急救護
-            # ------------------------------------------------
-            if action == "start_emergency":
-                if group_id in active_incidents:
-                    reply_text(
-                        event.reply_token,
-                        "⚠️ 目前已有進行中的救護事件，請先結束現有事件。"
-                    )
-
-                elif group_id in pending_locations:
-                    reply_text(
-                        event.reply_token,
-                        "目前已有緊急救護啟動流程正在等待事故地點。"
-                    )
-
-                else:
-                    pending = {
-                        "initiator": user_id,
-                        "initiator_name": get_display_name(
-                            group_id,
-                            user_id
-                        ),
-                        "created_at": now_tw(),
-                    }
-
-                    pending_locations[group_id] = pending
-
-                    schedule_timeout(
-                        "location",
-                        group_id,
-                        pending["created_at"]
-                    )
-
-                    line_bot_api.reply_message(
-                        event.reply_token,
-                        cancel_start_message()
-                    )
 
             # ------------------------------------------------
             # 取消啟動
             # ------------------------------------------------
-            elif action == "cancel_start":
+            if action == "cancel_start":
                 pending = pending_locations.get(group_id)
 
                 if pending and user_id == pending["initiator"]:
                     pending_locations.pop(group_id, None)
-
-                    task = timeout_tasks.pop(
-                        ("location", group_id),
-                        None
-                    )
-
+                    task = timeout_tasks.pop(("location", group_id), None)
                     if task and not task.done():
                         task.cancel()
 
                     reply_text(
                         event.reply_token,
-                        "已取消緊急救護啟動流程，尚未發送正式通知。"
+                        "已取消緊急救護啟動流程，尚未發送正式通知。",
                     )
-
                 else:
                     reply_text(
                         event.reply_token,
-                        "只有原始啟動人員可以取消此啟動流程。"
+                        "只有原始啟動人員可以取消此啟動流程。",
                     )
 
             # ------------------------------------------------
             # 取消事故地點修正
             # ------------------------------------------------
             elif action == "cancel_correction":
-                pending = pending_corrections.pop(
-                    group_id,
-                    None
-                )
+                pending = pending_corrections.pop(group_id, None)
 
                 if pending:
-                    task = timeout_tasks.pop(
-                        ("correction", group_id),
-                        None
-                    )
-
+                    task = timeout_tasks.pop(("correction", group_id), None)
                     if task and not task.done():
                         task.cancel()
 
                     reply_text(
                         event.reply_token,
-                        "已取消本次事故地點修正，維持原事故地點。"
+                        "已取消本次事故地點修正，維持原事故地點。",
                     )
-
                 else:
                     reply_text(
                         event.reply_token,
-                        "目前沒有等待中的事故地點修正流程。"
+                        "目前沒有等待中的事故地點修正流程。",
                     )
 
             # ------------------------------------------------
-            # 護理人員／工安人員分流回報
+            # 全體群組成員回報（可重複點擊更新，完整保留每次紀錄）
             # ------------------------------------------------
-            elif action in (
-                "ack_nurse_available", "ack_nurse_unavailable",
-                "ack_safety_available", "ack_safety_unavailable"
-            ):
+            elif action in ("ack_available", "ack_unavailable"):
                 incident = active_incidents.get(group_id)
-                requested_role = "nurse" if action.startswith("ack_nurse_") else "safety"
-                status = "available" if action.endswith("_available") else "unavailable"
-                actual_role = get_response_role(user_id)
+                status = "available" if action == "ack_available" else "unavailable"
 
                 if not incident or incident["id"] != incident_id:
                     reply_text(event.reply_token, "此救護事件已結束或通知已失效。")
                 elif not user_id:
                     reply_text(event.reply_token, "無法辨識回報帳號，請確認以個人 LINE 帳號操作。")
-                elif actual_role is None:
-                    reply_text(event.reply_token, "你尚未登記為護理人員或工安人員，無法使用專屬回報功能。")
-                elif actual_role != requested_role:
-                    if actual_role == "nurse":
-                        reply_text(event.reply_token, "你已登記為護理人員，請使用「護理人員回報」區，不需使用工安人員回報區。")
-                    else:
-                        reply_text(event.reply_token, "此按鈕僅限已登記護理人員使用，請使用「工安人員回報」區。")
-                elif user_id in incident["responses"]:
-                    old = incident["responses"][user_id]
-                    old_status = "可以前往" if old["status"] == "available" else "無法前往"
-                    reply_text(
-                        event.reply_token,
-                        f"已收到你的回報，不重複更新紀錄。\n首次回報身分：{'護理人員' if old.get('role') == 'nurse' else '工安人員'}\n首次回報狀態：{old_status}\n首次回報時間：{time_text(old['time'])}"
-                    )
                 else:
                     display_name = get_display_name(group_id, user_id)
                     timestamp = now_tw()
-                    response_record = {
-                        "role": actual_role,
-                        "status": status,
-                        "time": timestamp,
-                        "display_name": display_name,
-                    }
-                    if not save_incident_response(incident_id, user_id, response_record):
-                        reply_text(event.reply_token, "已收到你的回報，不重複更新紀錄。")
+
+                    # 檢查該人員先前是否已有回報紀錄
+                    previous_records = [
+                        r for r in incident["responses"] if r["user_id"] == user_id
+                    ]
+                    is_first = len(previous_records) == 0
+                    action_type = "initial" if is_first else "update"
+
+                    # 若狀態與上一筆完全相同，提示不重複寫入相同狀態，避免誤觸洗版
+                    if not is_first and previous_records[-1]["status"] == status:
+                        same_label = "可以前往" if status == "available" else "無法前往"
+                        reply_text(
+                            event.reply_token,
+                            f"ℹ️ {display_name}，你目前的回報狀態已經是「{same_label}」，"
+                            f"無需重複點擊（最後更新：{time_text(previous_records[-1]['time'])}）。",
+                        )
                         continue
-                    incident["responses"][user_id] = response_record
-                    role_label = "護理人員" if actual_role == "nurse" else "工安人員"
-                    status_label = (
-                        "收到，可以前往" if status == "available"
-                        else "收到，但無法前往"
-                    )
+
+                    record = {
+                        "user_id": user_id,
+                        "display_name": display_name,
+                        "status": status,
+                        "action_type": action_type,
+                        "time": timestamp,
+                    }
+
+                    seq = save_incident_response(incident_id, record)
+                    if not seq:
+                        reply_text(event.reply_token, "回報寫入失敗，請稍後再試。")
+                        continue
+
+                    record["seq"] = seq
+                    incident["responses"].append(record)
+
+                    status_label = "收到，可以前往" if status == "available" else "收到，但無法前往"
+                    header_label = "✅ 首次回報已登記" if is_first else "🔄 回報狀態已更新（已保留原紀錄）"
+
                     line_bot_api.reply_message(
                         event.reply_token,
                         [
-                            TextSendMessage(text=(
-                                f"✅ 回報已登記\n回報身分：{role_label}\n"
-                                f"回報人員：{display_name}\n回報狀態：{status_label}\n"
-                                f"首次回報時間：{time_text(timestamp)}"
-                            )),
+                            TextSendMessage(
+                                text=(
+                                    f"{header_label}\n"
+                                    f"回報人員：{display_name}\n"
+                                    f"最新狀態：{status_label}\n"
+                                    f"紀錄時間：{time_text(timestamp)}"
+                                )
+                            ),
                             TextSendMessage(text=incident_status_text(incident)),
-                        ]
+                        ],
                     )
 
             # ------------------------------------------------
-            # 確認人工結束事件
+            # 確認人工結束事件（原發起人於群組確認）
             # ------------------------------------------------
             elif action == "confirm_close":
                 incident = active_incidents.get(group_id)
 
                 if not incident or incident["id"] != incident_id:
-                    reply_text(
-                        event.reply_token,
-                        "此救護事件已結束或確認畫面已失效。"
-                    )
-
+                    reply_text(event.reply_token, "此救護事件已結束或確認畫面已失效。")
                 elif user_id != incident["initiator"]:
-                    reply_text(
-                        event.reply_token,
-                        "只有原始啟動人員可以結束此救護事件。"
-                    )
-
+                    reply_text(event.reply_token, "只有原始啟動人員可以結束此救護事件。")
                 else:
-                    # 先永久更新資料庫；成功後才停止計時並清除記憶體狀態。
-                    if not close_incident_record(incident_id, "closed"):
+                    ended_at = now_tw()
+                    if not close_incident_record(incident_id, "closed", ended_at=ended_at):
                         reply_text(event.reply_token, "資料庫未能確認事件結束，事件仍維持進行中，請稍後再試。")
                         continue
+
                     cancel_incident_timer(group_id)
                     active_incidents.pop(group_id, None)
                     pending_closures.pop(group_id, None)
 
+                    report_text = build_final_incident_report(
+                        incident,
+                        close_reason_label="原發起人手動結束",
+                        ended_at=ended_at,
+                    )
                     reply_text(
                         event.reply_token,
-                        f"✅ 救護事件已結束。\n"
-                        f"{incident_status_text(incident, include_unavailable=True)}"
+                        f"✅ 救護事件已結束。\n\n{report_text}",
                     )
 
             # ------------------------------------------------
@@ -1503,195 +1390,53 @@ async def callback(request: Request):
                     and user_id == incident["initiator"]
                 ):
                     pending_closures.pop(group_id, None)
-
                     reply_text(
                         event.reply_token,
-                        "已取消結束作業，救護事件及回報資料繼續保留。"
+                        "已取消結束作業，救護事件及回報資料繼續保留。",
                     )
-
                 else:
                     reply_text(
                         event.reply_token,
-                        "無法取消此結束確認，請確認事件狀態及操作權限。"
+                        "無法取消此結束確認，請確認事件狀態及操作權限。",
                     )
 
             continue
 
         # ====================================================
-        # 一般文字訊息處理
+        # 群組一般文字訊息處理
         # ====================================================
-        if not (
-            isinstance(event, MessageEvent)
-            and isinstance(event.message, TextMessage)
-        ):
+        if not (isinstance(event, MessageEvent) and isinstance(event.message, TextMessage)):
             continue
 
         text = event.message.text.strip()
-        user_id = get_user_id(event)
 
         # ----------------------------------------------------
-        # 人員登記管理（全域名單；僅最高管理者可開關及管理）
-        # ----------------------------------------------------
-        if text == "啟動護理人員登記":
-            if not is_admin(user_id):
-                reply_text(event.reply_token, "⛔ 此操作僅限最高管理者執行。")
-            elif get_next_nurse_slot() is None:
-                reply_text(event.reply_token, "三名護理人員名額均已登記完成。\n" + nurse_registration_status_text())
-            else:
-                nurse_registration_open = True
-                set_app_setting("nurse_registration_open", True)
-                line_bot_api.reply_message(event.reply_token, registration_prompt_message("nurse"))
-            continue
-
-        if text in ("取消護理人員登記", "關閉護理人員登記"):
-            if not is_admin(user_id):
-                reply_text(event.reply_token, "⛔ 此操作僅限最高管理者執行。")
-            else:
-                nurse_registration_open = False
-                set_app_setting("nurse_registration_open", False)
-                reply_text(event.reply_token, "已關閉護理人員登記；既有名單不受影響。\n" + nurse_registration_status_text())
-            continue
-
-        if text == "啟動工安人員登記":
-            if not is_admin(user_id):
-                reply_text(event.reply_token, "⛔ 此操作僅限最高管理者執行。")
-            else:
-                safety_registration_open = True
-                set_app_setting("safety_registration_open", True)
-                line_bot_api.reply_message(event.reply_token, registration_prompt_message("safety"))
-            continue
-
-        if text in ("關閉工安人員登記", "取消工安人員登記"):
-            if not is_admin(user_id):
-                reply_text(event.reply_token, "⛔ 此操作僅限最高管理者執行。")
-            else:
-                safety_registration_open = False
-                set_app_setting("safety_registration_open", False)
-                reply_text(event.reply_token, "已關閉工安人員登記；既有名單不受影響。\n" + safety_registration_status_text())
-            continue
-
-        if text in ("查詢護理人員登記", "查詢護理人員"):
-            if not is_admin(user_id):
-                reply_text(event.reply_token, "⛔ 此操作僅限最高管理者執行。")
-            else:
-                reply_text(event.reply_token, nurse_registration_status_text())
-            continue
-
-        if text in ("查詢工安人員", "查詢工安人員登記"):
-            if not is_admin(user_id):
-                reply_text(event.reply_token, "⛔ 此操作僅限最高管理者執行。")
-            else:
-                reply_text(event.reply_token, safety_registration_status_text())
-            continue
-
-        if text in ("查詢人員名單", "人員管理"):
-            if not is_admin(user_id):
-                reply_text(event.reply_token, "⛔ 此操作僅限最高管理者執行。")
-            else:
-                line_bot_api.reply_message(event.reply_token, admin_roster_message())
-            continue
-
-        if text in ("刪除護理人員1", "刪除護理人員2", "刪除護理人員3"):
-            if not is_admin(user_id):
-                reply_text(event.reply_token, "⛔ 此操作僅限最高管理者執行。")
-            else:
-                slot = int(text[-1])
-                delete_nurse_record(slot)
-                removed = nurse_users.pop(slot, None)
-                reply_text(event.reply_token, (f"✅ 已刪除護理人員{slot}：{removed.get('display_name') or '群組成員'}。\n" if removed else f"護理人員{slot}目前沒有登記資料。\n") + nurse_registration_status_text())
-            continue
-
-        if text == "重設護理人員名單":
-            if not is_admin(user_id):
-                reply_text(event.reply_token, "⛔ 此操作僅限最高管理者執行。")
-            else:
-                clear_nurse_records()
-                nurse_users.clear()
-                nurse_registration_open = False
-                set_app_setting("nurse_registration_open", False)
-                reply_text(event.reply_token, "✅ 已清空全部護理人員名單，登記模式已關閉。\n" + nurse_registration_status_text())
-            continue
-
-        if text == "重設工安人員名單":
-            if not is_admin(user_id):
-                reply_text(event.reply_token, "⛔ 此操作僅限最高管理者執行。")
-            else:
-                clear_safety_records()
-                safety_users.clear()
-                safety_registration_open = False
-                set_app_setting("safety_registration_open", False)
-                reply_text(event.reply_token, "✅ 已清空全部工安人員名單，登記模式已關閉。\n" + safety_registration_status_text())
-            continue
-
-        # 舊文字登記指令保留相容；新流程以按鈕為主。
-        if text == "我要登記護理人員":
-            if not nurse_registration_open:
-                reply_text(event.reply_token, "目前未開放護理人員登記，請聯絡最高管理者。")
-                continue
-            if not user_id:
-                reply_text(event.reply_token, "無法辨識你的 LINE 帳號。")
-                continue
-            existing = next((slot for slot, rec in nurse_users.items() if rec.get("user_id") == user_id), None)
-            if existing:
-                reply_text(event.reply_token, f"你已登記為護理人員{existing}。")
-                continue
-            slot = get_next_nurse_slot()
-            if slot is None:
-                nurse_registration_open = False
-                set_app_setting("nurse_registration_open", False)
-                reply_text(event.reply_token, "三名護理人員名額已滿。")
-                continue
-            display_name = get_display_name(group_id, user_id)
-            new_record = {"user_id": user_id, "display_name": display_name}
-            save_nurse_record(slot, new_record)
-            nurse_users[slot] = new_record
-            if get_next_nurse_slot() is None:
-                nurse_registration_open = False
-                set_app_setting("nurse_registration_open", False)
-            reply_text(event.reply_token, f"✅ 護理人員{slot}登記成功：{display_name}。\n" + nurse_registration_status_text())
-            continue
-
-        if text == "我要登記工安人員":
-            if not safety_registration_open:
-                reply_text(event.reply_token, "目前未開放工安人員登記，請聯絡最高管理者。")
-                continue
-            if not user_id:
-                reply_text(event.reply_token, "無法辨識你的 LINE 帳號。")
-                continue
-            if user_id in safety_users:
-                reply_text(event.reply_token, "你已登記為工安人員，不需重複登記。")
-                continue
-            display_name = get_display_name(group_id, user_id)
-            new_record = {"user_id": user_id, "display_name": display_name}
-            save_safety_record(user_id, new_record)
-            safety_users[user_id] = new_record
-            reply_text(event.reply_token, f"✅ 工安人員登記成功：{display_name}。\n" + safety_registration_status_text())
-            continue
-
-        if text.startswith("刪除工安人員 "):
-            if not is_admin(user_id):
-                reply_text(event.reply_token, "⛔ 此操作僅限最高管理者執行。")
-            else:
-                target_name = text.replace("刪除工安人員 ", "", 1).strip()
-                matches = [uid for uid, rec in safety_users.items() if rec.get("display_name") == target_name or uid == target_name]
-                if len(matches) == 1:
-                    delete_safety_record(matches[0])
-                    removed = safety_users.pop(matches[0])
-                    reply_text(event.reply_token, f"✅ 已刪除工安人員：{removed.get('display_name') or '工安人員'}。\n" + safety_registration_status_text())
-                elif len(matches) > 1:
-                    reply_text(event.reply_token, "同名人員不只一位，請使用人員管理面板個別刪除。")
-                else:
-                    reply_text(event.reply_token, "找不到指定工安人員，請先查詢名單。")
-            continue
-
-        # ----------------------------------------------------
-        # 119：顯示緊急救護面板
+        # 119：直接詢問事故地點並啟動 5 分鐘等待
         # ----------------------------------------------------
         if text == "119":
-            line_bot_api.reply_message(
-                event.reply_token,
-                panel_message()
-            )
+            if group_id in active_incidents:
+                reply_text(
+                    event.reply_token,
+                    "⚠️ 目前已有進行中的救護事件，請先結束現有事件（或輸入「回報狀況」檢視進度）。",
+                )
+            elif group_id in pending_locations:
+                reply_text(
+                    event.reply_token,
+                    "⏳ 目前已有緊急救護啟動流程正在等待事故地點，請直接輸入事故地點文字。",
+                )
+            else:
+                pending = {
+                    "initiator": user_id,
+                    "initiator_name": get_display_name(group_id, user_id),
+                    "created_at": now_tw(),
+                }
+                pending_locations[group_id] = pending
+                schedule_timeout("location", group_id, pending["created_at"])
+
+                line_bot_api.reply_message(
+                    event.reply_token,
+                    ask_location_message(),
+                )
             continue
 
         # ----------------------------------------------------
@@ -1699,54 +1444,35 @@ async def callback(request: Request):
         # ----------------------------------------------------
         if text == "回報狀況":
             incident = active_incidents.get(group_id)
-
             if incident:
-                reply_text(
-                    event.reply_token,
-                    incident_status_text(incident)
-                )
+                reply_text(event.reply_token, incident_status_text(incident, include_unavailable=True))
             else:
-                reply_text(
-                    event.reply_token,
-                    "目前沒有進行中的救護事件。"
-                )
-
+                reply_text(event.reply_token, "目前沒有進行中的救護事件。")
             continue
 
         # ----------------------------------------------------
-        # 結束救護事件
+        # 結束救護事件（原啟動人員）
         # ----------------------------------------------------
         if text == "結束救護事件":
             incident = active_incidents.get(group_id)
 
             if not incident:
-                reply_text(
-                    event.reply_token,
-                    "目前沒有進行中的救護事件。"
-                )
-
+                reply_text(event.reply_token, "目前沒有進行中的救護事件。")
             elif user_id != incident["initiator"]:
                 reply_text(
                     event.reply_token,
-                    "只有原始啟動人員可以提出結束救護事件。"
+                    "只有原始啟動人員（或最高管理者透過私訊）可以提出結束救護事件。",
                 )
-
             else:
-                status = incident_status_text(incident)
-
+                status = incident_status_text(incident, include_unavailable=True)
                 pending_closures[group_id] = {
                     "incident_id": incident["id"],
-                    "initiator": user_id
+                    "initiator": user_id,
                 }
-
                 line_bot_api.reply_message(
                     event.reply_token,
-                    close_confirmation_message(
-                        incident["id"],
-                        status
-                    )
+                    close_confirmation_message(incident["id"], status),
                 )
-
             continue
 
         # ----------------------------------------------------
@@ -1756,36 +1482,21 @@ async def callback(request: Request):
             incident = active_incidents.get(group_id)
 
             if not incident:
-                reply_text(
-                    event.reply_token,
-                    "目前沒有進行中的救護事件，無法修改事故地點。"
-                )
-
+                reply_text(event.reply_token, "目前沒有進行中的救護事件，無法修改事故地點。")
             elif group_id in pending_corrections:
-                reply_text(
-                    event.reply_token,
-                    "目前已有事故地點修正流程，請先完成或取消。"
-                )
-
+                reply_text(event.reply_token, "目前已有事故地點修正流程，請先完成或取消。")
             else:
                 pending = {
                     "created_at": now_tw(),
-                    "incident_id": incident["id"]
+                    "incident_id": incident["id"],
                 }
-
                 pending_corrections[group_id] = pending
-
-                schedule_timeout(
-                    "correction",
-                    group_id,
-                    pending["created_at"]
-                )
+                schedule_timeout("correction", group_id, pending["created_at"])
 
                 line_bot_api.reply_message(
                     event.reply_token,
-                    cancel_correction_message()
+                    cancel_correction_message(),
                 )
-
             continue
 
         # ----------------------------------------------------
@@ -1793,19 +1504,11 @@ async def callback(request: Request):
         # ----------------------------------------------------
         if group_id in pending_corrections:
             if expire_if_needed("correction", group_id):
-                reply_text(
-                    event.reply_token,
-                    "事故地點修正已逾時取消，維持原事故地點。"
-                )
+                reply_text(event.reply_token, "事故地點修正已逾時取消，維持原事故地點。")
                 continue
 
             pending = pending_corrections.pop(group_id)
-
-            task = timeout_tasks.pop(
-                ("correction", group_id),
-                None
-            )
-
+            task = timeout_tasks.pop(("correction", group_id), None)
             if task and not task.done():
                 task.cancel()
 
@@ -1813,29 +1516,44 @@ async def callback(request: Request):
 
             if incident and incident["id"] == pending["incident_id"]:
                 old_location = incident["location"]
-                if not update_incident_location(incident["id"], text):
+                updated_at = now_tw()
+                updater_name = get_display_name(group_id, user_id)
+
+                if not update_incident_location(
+                    incident["id"],
+                    old_location,
+                    text,
+                    user_id or "unknown",
+                    updater_name,
+                    updated_at,
+                ):
                     reply_text(event.reply_token, "事故地點更新失敗，原地點維持不變，請稍後再試。")
                     continue
+
                 incident["location"] = text
+                incident["location_logs"].append({
+                    "old_location": old_location,
+                    "new_location": text,
+                    "updated_by": user_id or "unknown",
+                    "updated_by_name": updater_name,
+                    "updated_at": updated_at,
+                })
 
                 line_bot_api.reply_message(
                     event.reply_token,
                     TextSendMessage(
                         text=(
                             f"📍【事故地點更正】\n"
+                            f"事件編號：{incident['id']}\n"
                             f"原事故地點：{old_location}\n"
                             f"最新事故地點：{text}\n"
-                            "請所有救護人員以最新地點為準。"
+                            f"更正人員：{updater_name}（{time_text(updated_at)}）\n"
+                            "請所有救護支援人員以最新地點為準。"
                         )
-                    )
+                    ),
                 )
-
             else:
-                reply_text(
-                    event.reply_token,
-                    "原救護事件已不存在，本次地點修正未套用。"
-                )
-
+                reply_text(event.reply_token, "原救護事件已不存在，本次地點修正未套用。")
             continue
 
         # ----------------------------------------------------
@@ -1843,65 +1561,57 @@ async def callback(request: Request):
         # ----------------------------------------------------
         if group_id in pending_locations:
             if expire_if_needed("location", group_id):
-                reply_text(
-                    event.reply_token,
-                    "緊急救護啟動流程已逾時取消，請重新點選緊急救護。"
-                )
+                reply_text(event.reply_token, "緊急救護啟動流程已逾時取消，請重新輸入 119 啟動。")
                 continue
 
             pending = pending_locations.pop(group_id)
-
-            task = timeout_tasks.pop(
-                ("location", group_id),
-                None
-            )
-
+            task = timeout_tasks.pop(("location", group_id), None)
             if task and not task.done():
                 task.cancel()
 
             incident_id = next_incident_id()
+            created_at = now_tw()
 
             incident = {
                 "id": incident_id,
+                "group_id": group_id,
+                "initial_location": text,
                 "location": text,
                 "initiator": pending["initiator"],
                 "initiator_name": pending["initiator_name"],
-                "created_at": now_tw(),
-                "responses": {},
+                "created_at": created_at,
+                "responses": [],
+                "location_logs": [],
             }
 
-            # 事件資料先成功寫入 PostgreSQL，才正式啟動通知及計時。
             try:
                 create_incident_record(incident, group_id)
             except Exception as error:
                 print(f"救護事件寫入資料庫失敗：{error}")
-                reply_text(event.reply_token, "⚠️ 救護事件資料保存失敗，未發送正式通知；請稍後重新啟動。")
+                reply_text(event.reply_token, "⚠️ 救護事件資料保存失敗，未發送正式通知；請稍後重新輸入 119 啟動。")
                 continue
 
             active_incidents[group_id] = incident
 
-            # 建立1小時提醒及2小時自動結束任務
-            schedule_incident_timer(
-                group_id,
-                incident
-            )
+            # 建立啟動滿 1 小時自動結束計時任務
+            schedule_incident_timer(group_id, incident)
 
             notice = (
                 "🚨【緊急救護通知】🚨\n"
                 f"事件編號：{incident_id}\n"
                 f"事故地點：{text}\n"
-                "請相關救護人員前往處理。\n"
-                "已登記護理人員及工安人員，請依身分使用專屬按鈕回報。"
+                f"啟動人員：{pending['initiator_name']}\n"
+                f"啟動時間：{time_text(created_at)}\n"
+                "請相關人員前往協助處理，並點擊下方按鈕回報是否可以前往。"
             )
 
-            # 保留原有真正的 LINE 群組 @All 通知
+            # 沿用原有已測試成功的 LINE 群組 @All 通知機制
             reply_emergency_notice(
                 event.reply_token,
                 notice,
                 incident_id,
-                group_id
+                group_id,
             )
-
             continue
 
     return "OK"
