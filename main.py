@@ -580,7 +580,7 @@ def build_admin_menu():
         "管理選單：顯示本選單\n"
         "查詢目前事件：查詢所有群組進行中事件\n"
         "查詢救護事件 YYYYMMDD01：查詢指定事件完整資料\n"
-        "結束救護事件 YYYYMMDD01：立即結束指定事件\n"
+        "結束救護事件：結束目前進行中的事件（可於私訊或救護群組操作）\n"
         "系統狀態：查詢機器人及資料庫狀態"
     )
 
@@ -696,17 +696,22 @@ async def callback(request: Request):
                         incident = get_incident_by_id(incident_id)
                         reply_text(event.reply_token, build_historical_report(incident) if incident
                                    else "查無此救護事件，請確認事件編號。")
-                    elif text.startswith("結束救護事件 "):
-                        incident_id = text.replace("結束救護事件 ", "", 1).strip()
-                        incident = get_incident_by_id(incident_id)
-                        if not incident:
-                            reply_text(event.reply_token, "查無此救護事件，請確認事件編號。")
-                        elif incident["status"] != "active":
-                            reply_text(event.reply_token, "此救護事件已結束，無須重複操作。")
-                        elif finish_incident(incident["group_id"], incident_id, "最高管理者人工結束"):
-                            reply_text(event.reply_token, f"已立即結束救護事件 {incident_id}，完整結束報告已發送至原救護群組。")
+                    elif text == "結束救護事件":
+                        current = list(active_incidents.items())
+                        if not current:
+                            reply_text(event.reply_token, "目前沒有進行中的救護事件。")
+                        elif len(current) > 1:
+                            reply_text(
+                                event.reply_token,
+                                "目前有多件救護事件進行中，請至欲結束事件所屬的群組輸入「結束救護事件」。"
+                            )
                         else:
-                            reply_text(event.reply_token, "事件結束失敗，資料庫狀態未變更，請稍後再試。")
+                            group_id, incident = current[0]
+                            incident_id = incident["id"]
+                            if finish_incident(group_id, incident_id, "最高管理者人工結束"):
+                                reply_text(event.reply_token, f"已立即結束救護事件 {incident_id}，完整結束報告已發送至原救護群組。")
+                            else:
+                                reply_text(event.reply_token, "事件結束失敗，資料庫狀態未變更，請稍後再試。")
                     elif text == "系統狀態":
                         try:
                             with get_db_connection() as conn:
@@ -726,7 +731,6 @@ async def callback(request: Request):
             if is_admin(user_id) and (
                 text in ("管理選單", "查詢目前事件", "系統狀態")
                 or text.startswith("查詢救護事件 ")
-                or text.startswith("結束救護事件 ")
                 or text in ("人員管理", "查詢人員名單", "啟動護理人員登記", "關閉護理人員登記",
                             "啟動工安人員登記", "關閉工安人員登記", "重設護理人員名單", "重設工安人員名單")
             ):
@@ -817,6 +821,25 @@ async def callback(request: Request):
             continue
 
         text = event.message.text.strip()
+
+        # 結束目前群組的救護事件：僅最高管理者或該事件啟動者可操作。
+        if text == "結束救護事件":
+            incident = active_incidents.get(group_id)
+            if not incident:
+                reply_text(event.reply_token, "目前此群組沒有進行中的救護事件。")
+            elif is_admin(user_id):
+                if finish_incident(group_id, incident["id"], "最高管理者人工結束"):
+                    reply_text(event.reply_token, f"已立即結束救護事件 {incident['id']}，完整結束報告已發送至原救護群組。")
+                else:
+                    reply_text(event.reply_token, "事件結束失敗，資料庫狀態未變更，請稍後再試。")
+            elif user_id and user_id == incident.get("initiator"):
+                if finish_incident(group_id, incident["id"], "事件啟動者人工結束"):
+                    reply_text(event.reply_token, f"已立即結束救護事件 {incident['id']}，完整結束報告已發送至原救護群組。")
+                else:
+                    reply_text(event.reply_token, "事件結束失敗，資料庫狀態未變更，請稍後再試。")
+            else:
+                reply_text(event.reply_token, "⛔ 僅最高管理者或本次救護事件啟動者可以結束事件。")
+            continue
 
         # 119：直接啟動，要求輸入事故地點
         if text == "119":
