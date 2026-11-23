@@ -892,12 +892,12 @@ async def callback(request: Request):
                 reply_text(event.reply_token, "目前此群組沒有進行中的救護事件。")
             elif is_admin(user_id):
                 if finish_incident(group_id, incident["id"], "最高管理者人工結束", notify_group=False):
-                    reply_text(event.reply_token, f"已立即結束救護事件 {incident['id']}。系統已嘗試將完整結束報告傳送至最高管理者私訊。")
+                    reply_text(event.reply_token, f"已立即結束救護事件 {incident['id']}。")
                 else:
                     reply_text(event.reply_token, "事件結束失敗，資料庫狀態未變更，請稍後再試。")
             elif user_id and user_id == incident.get("initiator"):
                 if finish_incident(group_id, incident["id"], "事件啟動者人工結束", notify_group=False):
-                    reply_text(event.reply_token, f"已立即結束救護事件 {incident['id']}。系統已嘗試將完整結束報告傳送至最高管理者私訊。")
+                    reply_text(event.reply_token, f"已立即結束救護事件 {incident['id']}。")
                 else:
                     reply_text(event.reply_token, "事件結束失敗，資料庫狀態未變更，請稍後再試。")
             else:
