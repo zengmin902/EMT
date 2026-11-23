@@ -704,24 +704,32 @@ def response_message(incident_id):
 # ============================================================
 def reply_emergency_notice(reply_token, notice, incident_id, group_id):
     """
-    使用 LINE Text Message V2 同時真正 @All 及 @已登記護理人員。
-    標記全域名單中已登記的護理人員；空缺名額不會影響通知。
-    若 API 呼叫失敗，改用一般通知及回報卡片。
+    優先以 Reply 發送真正 @All、群組內已登記護理人員 Mention 及回報卡片。
+    先確認護理人員確實屬於本次事件群組，避免跨群組 Mention 導致整筆訊息 HTTP 400。
+    Reply 失敗後改用 Push 補送，絕不重複使用同一個 reply_token。
     """
     substitutions = {
         "everyone": {
             "type": "mention",
-            "mentionee": {
-                "type": "all"
-            }
+            "mentionee": {"type": "all"}
         }
     }
 
     mention_tokens = []
-
     for slot, record in get_group_nurses():
         user_id = record.get("user_id")
         if not user_id:
+            continue
+
+        # 全域名單不代表每位人員都是本次事件群組的成員。
+        # 只有確認屬於目前群組，才加入 Mention，避免 LINE API 拒絕整筆訊息。
+        try:
+            line_bot_api.get_group_member_profile(group_id, user_id)
+        except Exception as member_error:
+            print(
+                f"本群組未能確認護理人員 {record.get('display_name') or user_id} "
+                f"為群組成員，略過該員 Mention：{member_error}"
+            )
             continue
 
         token_name = f"nurse{slot}"
@@ -735,12 +743,13 @@ def reply_emergency_notice(reply_token, notice, incident_id, group_id):
         }
 
     mention_line = " ".join(mention_tokens)
+    text_v2 = "{everyone}\n"
     if mention_line:
-        text_v2 = "{everyone}\n" + mention_line + "\n" + notice
-    else:
-        text_v2 = "{everyone}\n" + notice
+        text_v2 += mention_line + "\n"
+    text_v2 += notice
 
-    payload = {
+    flex_contents = response_message_contents(incident_id)
+    reply_payload = {
         "replyToken": reply_token,
         "messages": [
             {
@@ -751,17 +760,14 @@ def reply_emergency_notice(reply_token, notice, incident_id, group_id):
             {
                 "type": "flex",
                 "altText": "請回報是否可以前往支援",
-                "contents": response_message_contents(incident_id)
+                "contents": flex_contents
             }
         ]
     }
 
-    request = urllib.request.Request(
+    reply_request = urllib.request.Request(
         "https://api.line.me/v2/bot/message/reply",
-        data=json.dumps(
-            payload,
-            ensure_ascii=False
-        ).encode("utf-8"),
+        data=json.dumps(reply_payload, ensure_ascii=False).encode("utf-8"),
         headers={
             "Content-Type": "application/json",
             "Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}"
@@ -770,31 +776,93 @@ def reply_emergency_notice(reply_token, notice, incident_id, group_id):
     )
 
     try:
-        with urllib.request.urlopen(request, timeout=10) as response:
+        with urllib.request.urlopen(reply_request, timeout=10) as response:
             response.read()
 
-        nurse_count = len(mention_tokens)
         print(
-            "緊急救護通知已發送真正的 @All，"
-            f"並標記 {nurse_count} 名已登記護理人員。"
+            "緊急救護通知已發送：真正的 @All，"
+            f"並 Mention 本群組內 {len(mention_tokens)} 名已登記護理人員。"
         )
+        return
 
     except Exception as error:
-        print(f"LINE @All／護理人員 @Mention 發送失敗，改用一般通知：{error}")
+        # 記錄 LINE 回傳的 HTTP 狀態及錯誤本文，方便追查真正原因。
+        error_body = ""
+        if hasattr(error, "read"):
+            try:
+                error_body = error.read().decode("utf-8", errors="replace")
+            except Exception:
+                error_body = ""
+        error_status = getattr(error, "code", "未知")
+        print(
+            f"LINE 緊急救護 Reply 發送失敗；HTTP 狀態：{error_status}；"
+            f"錯誤內容：{error_body or str(error)}"
+        )
 
-        try:
-            line_bot_api.reply_message(
-                reply_token,
-                [
-                    TextSendMessage(text=notice),
-                    response_message(incident_id)
-                ]
-            )
+    # Reply Token 僅能使用一次；第一次 Reply 失敗後，不可再次拿它呼叫 reply_message。
+    # 改用 Push API 發送 @All 及回報卡片，不依賴原 reply_token。
+    push_payload = {
+        "to": group_id,
+        "messages": [
+            {
+                "type": "textV2",
+                "text": "{everyone}\n" + notice,
+                "substitution": {
+                    "everyone": {
+                        "type": "mention",
+                        "mentionee": {"type": "all"}
+                    }
+                }
+            },
+            {
+                "type": "flex",
+                "altText": "請回報是否可以前往支援",
+                "contents": flex_contents
+            }
+        ]
+    }
 
-            print("一般緊急救護通知及回報卡片已送出。")
+    push_request = urllib.request.Request(
+        "https://api.line.me/v2/bot/message/push",
+        data=json.dumps(push_payload, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}"
+        },
+        method="POST"
+    )
 
-        except Exception as fallback_error:
-            print(f"一般通知補送也失敗：{fallback_error}")
+    try:
+        with urllib.request.urlopen(push_request, timeout=10) as response:
+            response.read()
+        print("緊急救護通知已改用 Push API 補送：@All 及回報卡片。")
+        return
+
+    except Exception as push_error:
+        push_body = ""
+        if hasattr(push_error, "read"):
+            try:
+                push_body = push_error.read().decode("utf-8", errors="replace")
+            except Exception:
+                push_body = ""
+        push_status = getattr(push_error, "code", "未知")
+        print(
+            f"Push @All 補送失敗；HTTP 狀態：{push_status}；"
+            f"錯誤內容：{push_body or str(push_error)}"
+        )
+
+    # 最後一道保底：即使 @All 格式也失敗，仍嘗試送出一般群組通知及回報卡片。
+    try:
+        line_bot_api.push_message(
+            group_id,
+            [
+                TextSendMessage(text=notice),
+                response_message(incident_id)
+            ]
+        )
+        print("一般緊急救護通知及回報卡片已透過 Push API 補送。")
+    except Exception as fallback_error:
+        print(f"一般 Push 通知補送仍失敗：{fallback_error}")
 
 
 # ============================================================
