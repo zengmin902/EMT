@@ -474,20 +474,52 @@ def cancel_incident_timer(group_id):
         task.cancel()
 
 
-def finish_incident(group_id, incident_id, end_type):
+def finish_incident(group_id, incident_id, end_type, notify_group=True):
+    """結束事件；完整報告只私訊最高管理者，群組僅發簡短結束通知。"""
     incident = active_incidents.get(group_id)
     if not incident or incident["id"] != incident_id:
         return False
+
     status = "auto_closed" if end_type == "系統自動結束" else "closed"
     if not close_incident_record(incident_id, status, end_type):
         return False
+
+    # 資料庫已完成結束後，再停止計時及移除記憶體中的進行中事件。
+    incident["ended_at"] = now_tw()
     cancel_incident_timer(group_id)
     active_incidents.pop(group_id, None)
     pending_closures.pop(group_id, None)
+
+    # 完整結束報告只傳送給最高管理者，不在救護群組公開完整回報名單及歷程。
+    report_sent = False
     try:
-        line_bot_api.push_message(group_id, TextSendMessage(text=build_final_report(incident, end_type)))
+        line_bot_api.push_message(
+            ADMIN_USER_ID,
+            TextSendMessage(text=build_final_report(incident, end_type))
+        )
+        report_sent = True
+        print(f"完整救護事件結束報告已私訊最高管理者：{incident_id}")
     except Exception as error:
-        print(f"事件結束報告發送失敗：{incident_id}；{error}")
+        print(f"最高管理者私訊結束報告發送失敗：{incident_id}；{error}")
+
+    # 群組只通知事件已結束，不顯示完整報告。
+    if notify_group:
+        report_notice = (
+            "完整結束報告已傳送至最高管理者私訊。"
+            if report_sent else
+            "⚠️ 完整結束報告私訊傳送失敗，請最高管理者確認機器人私訊功能。"
+        )
+        group_notice = (
+            "✅【救護事件已結束】\n"
+            f"事件編號：{incident_id}\n"
+            f"結束方式：{end_type}\n"
+            f"{report_notice}"
+        )
+        try:
+            line_bot_api.push_message(group_id, TextSendMessage(text=group_notice))
+        except Exception as error:
+            print(f"群組事件結束簡短通知發送失敗：{incident_id}；{error}")
+
     return True
 
 
@@ -709,7 +741,7 @@ async def callback(request: Request):
                             group_id, incident = current[0]
                             incident_id = incident["id"]
                             if finish_incident(group_id, incident_id, "最高管理者人工結束"):
-                                reply_text(event.reply_token, f"已立即結束救護事件 {incident_id}，完整結束報告已發送至原救護群組。")
+                                reply_text(event.reply_token, f"已立即結束救護事件 {incident_id}。系統已嘗試將完整結束報告傳送至最高管理者私訊，原救護群組僅收到簡短結束通知。")
                             else:
                                 reply_text(event.reply_token, "事件結束失敗，資料庫狀態未變更，請稍後再試。")
                     elif text == "系統狀態":
@@ -828,13 +860,13 @@ async def callback(request: Request):
             if not incident:
                 reply_text(event.reply_token, "目前此群組沒有進行中的救護事件。")
             elif is_admin(user_id):
-                if finish_incident(group_id, incident["id"], "最高管理者人工結束"):
-                    reply_text(event.reply_token, f"已立即結束救護事件 {incident['id']}，完整結束報告已發送至原救護群組。")
+                if finish_incident(group_id, incident["id"], "最高管理者人工結束", notify_group=False):
+                    reply_text(event.reply_token, f"已立即結束救護事件 {incident['id']}。系統已嘗試將完整結束報告傳送至最高管理者私訊。")
                 else:
                     reply_text(event.reply_token, "事件結束失敗，資料庫狀態未變更，請稍後再試。")
             elif user_id and user_id == incident.get("initiator"):
-                if finish_incident(group_id, incident["id"], "事件啟動者人工結束"):
-                    reply_text(event.reply_token, f"已立即結束救護事件 {incident['id']}，完整結束報告已發送至原救護群組。")
+                if finish_incident(group_id, incident["id"], "事件啟動者人工結束", notify_group=False):
+                    reply_text(event.reply_token, f"已立即結束救護事件 {incident['id']}。系統已嘗試將完整結束報告傳送至最高管理者私訊。")
                 else:
                     reply_text(event.reply_token, "事件結束失敗，資料庫狀態未變更，請稍後再試。")
             else:
@@ -854,6 +886,18 @@ async def callback(request: Request):
                 pending_locations[group_id] = pending
                 schedule_timeout("location", group_id, pending["created_at"])
                 reply_text(event.reply_token, "🚨【緊急救護啟動】\n請直接輸入事故地點；收到地點後將立即建立救護事件並通知全群。")
+            continue
+
+        # 隨時重新叫出目前事件的救護回報卡片，避免原卡片被群組訊息洗版。
+        if text == "救護回報":
+            incident = active_incidents.get(group_id)
+            if not incident:
+                reply_text(event.reply_token, "目前沒有進行中的救護事件，無法提供回報按鈕。")
+            else:
+                line_bot_api.reply_message(
+                    event.reply_token,
+                    response_message(incident["id"])
+                )
             continue
 
         # 回報目前狀況
@@ -929,7 +973,8 @@ async def callback(request: Request):
                 "🚨【緊急救護通知】🚨\n"
                 f"事件編號：{incident_id}\n"
                 f"事故地點：{text}\n"
-                "請群組全體成員確認是否可以前往支援，並使用下方按鈕回報。"
+                "請群組全體成員確認是否可以前往支援，並使用下方按鈕回報。\n"
+                "若回報卡片被新訊息洗版，可輸入「救護回報」重新叫出按鈕。"
             )
             reply_emergency_notice(event.reply_token, notice, incident_id, group_id)
             continue
