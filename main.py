@@ -394,33 +394,65 @@ def expire_if_needed(kind, group_id):
     return False
 
 
-def response_message_contents(incident_id):
+def response_message_contents(incident_id, location=""):
+    """緊急救護回報 Flex 卡片；保留原有 Postback 回報資料。"""
+    location_text = str(location or "事故地點未提供")
     return {
         "type": "bubble",
-        "body": {"type": "box", "layout": "vertical", "spacing": "md", "contents": [
-            {"type": "text", "text": "救護人員回報", "weight": "bold", "size": "lg"},
-            {"type": "text", "text": "請所有群組成員依目前狀況選擇，之後可再次修改。", "wrap": True, "size": "sm"},
-            {"type": "button", "style": "primary", "color": "#16834A", "height": "md",
-             "action": postback("可前往", f"action=ack_available&incident_id={incident_id}")},
-            {"type": "button", "style": "secondary", "color": "#B3261E", "height": "md",
-             "action": postback("無法前往", f"action=ack_unavailable&incident_id={incident_id}")}
-        ]}
+        "size": "kilo",
+        "header": {
+            "type": "box", "layout": "vertical", "backgroundColor": "#B42318",
+            "paddingAll": "18px", "spacing": "sm", "contents": [
+                {"type": "text", "text": "🚨 緊急救護通知", "weight": "bold",
+                 "size": "xl", "color": "#FFFFFF", "wrap": True},
+                {"type": "text", "text": "請立即確認是否能前往支援",
+                 "size": "sm", "color": "#FFFFFF", "wrap": True}
+            ]
+        },
+        "body": {
+            "type": "box", "layout": "vertical", "spacing": "md",
+            "paddingAll": "18px", "contents": [
+                {"type": "box", "layout": "vertical", "backgroundColor": "#FCE7E7",
+                 "cornerRadius": "12px", "paddingAll": "16px", "spacing": "sm", "contents": [
+                    {"type": "text", "text": "📍 事故地點", "size": "sm",
+                     "weight": "bold", "color": "#991B1B"},
+                    {"type": "text", "text": location_text, "size": "xxl",
+                     "weight": "bold", "color": "#991B1B", "wrap": True}
+                ]},
+                {"type": "text", "text": "請選擇您的支援狀況", "size": "md",
+                 "weight": "bold", "wrap": True, "margin": "sm"},
+                {"type": "button", "style": "primary", "color": "#16834A",
+                 "height": "md", "action": postback(
+                     "可前往", f"action=ack_available&incident_id={incident_id}")},
+                {"type": "button", "style": "secondary", "color": "#64748B",
+                 "height": "md", "action": postback(
+                     "無法前往", f"action=ack_unavailable&incident_id={incident_id}")}
+            ]
+        },
+        "footer": {
+            "type": "box", "layout": "vertical", "paddingAll": "12px",
+            "backgroundColor": "#F3F4F6", "contents": [
+                {"type": "text",
+                 "text": "卡片若被洗版，輸入「救護回報」即可重新叫出。",
+                 "size": "xs", "color": "#667085", "wrap": True}
+            ]
+        }
     }
 
 
-def response_message(incident_id):
+def response_message(incident_id, location=""):
     return flex_message(
-        "請回報是否可以前往支援",
-        response_message_contents(incident_id)
+        "緊急救護通知－請回報是否可以前往支援",
+        response_message_contents(incident_id, location)
     )
 
 
 # ============================================================
 # LINE 群組真正的 @All 通知
 # ============================================================
-def reply_emergency_notice(reply_token, notice, incident_id, group_id):
+def reply_emergency_notice(reply_token, notice, incident_id, group_id, notice_location=""):
     """保留已測試的真正 @All 通知及 Flex 卡片；Reply 失敗改用 Push。"""
-    flex_contents = response_message_contents(incident_id)
+    flex_contents = response_message_contents(incident_id, notice_location)
     def send(url, payload):
         request = urllib.request.Request(
             url, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
@@ -460,7 +492,7 @@ def reply_emergency_notice(reply_token, notice, incident_id, group_id):
         body = error.read().decode("utf-8", errors="replace") if hasattr(error, "read") else str(error)
         print(f"Push @All 失敗：{getattr(error, 'code', '未知')}；{body}")
         try:
-            line_bot_api.push_message(group_id, [TextSendMessage(text=notice), response_message(incident_id)])
+            line_bot_api.push_message(group_id, [TextSendMessage(text=notice), response_message(incident_id, notice_location)])
         except Exception as fallback_error:
             print(f"一般 Push 補送失敗：{fallback_error}")
 
@@ -896,7 +928,7 @@ async def callback(request: Request):
             else:
                 line_bot_api.reply_message(
                     event.reply_token,
-                    response_message(incident["id"])
+                    response_message(incident["id"], incident.get("location", ""))
                 )
             continue
 
@@ -969,14 +1001,11 @@ async def callback(request: Request):
 
             active_incidents[group_id] = incident
             schedule_incident_timer(group_id, incident)
-            notice = (
-                "🚨【緊急救護通知】🚨\n"
-                f"事件編號：{incident_id}\n"
-                f"事故地點：{text}\n"
-                "請群組全體成員確認是否可以前往支援，並使用下方按鈕回報。\n"
-                "若回報卡片被新訊息洗版，可輸入「救護回報」重新叫出按鈕。"
+            # @All 訊息僅保留簡短提示；事故資訊與操作說明統一呈現在 Flex 卡片。
+            notice = "🚨 緊急救護通知，請查看下方卡片並回報支援狀況。"
+            reply_emergency_notice(
+                event.reply_token, notice, incident_id, group_id, text
             )
-            reply_emergency_notice(event.reply_token, notice, incident_id, group_id)
             continue
 
     return "OK"
