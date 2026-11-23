@@ -442,7 +442,7 @@ def response_message_contents(incident_id, location=""):
 
 def response_message(incident_id, location=""):
     return flex_message(
-        "緊急救護通知－請回報是否可以前往支援",
+        "緊急救護通知－請回報是否可前往支援",
         response_message_contents(incident_id, location)
     )
 
@@ -835,10 +835,9 @@ async def callback(request: Request):
                     continue
                 incident["responses"][user_id] = record
 
-                status_label = "可前往" if status == "available" else "無法前往"
-                reply_text(event.reply_token, f"✅ 已登記：{status_label}\n回報人員：{display_name}\n回報時間：{time_text(timestamp)}")
-
-                # 可前往時通知群組；無法前往不額外通知。
+                # 成功保存後不使用 reply_token 回覆群組，避免公開顯示個人回報結果。
+                # 僅在符合條件的「可前往」回報時，另行推播群組通知。
+                # 無法前往僅保存於資料庫，供事件結束報告彙整。
                 # 從無法前往改為可前往，也會再次通知最新狀態。
                 if status == "available" and old_status != "available":
                     try:
@@ -1002,7 +1001,7 @@ async def callback(request: Request):
             active_incidents[group_id] = incident
             schedule_incident_timer(group_id, incident)
             # @All 訊息僅保留簡短提示；事故資訊與操作說明統一呈現在 Flex 卡片。
-            notice = "🚨 緊急救護通知，請查看下方卡片並回報支援狀況。"
+            notice = "🚨 緊急救護通知，請回報支援狀況。"
             reply_emergency_notice(
                 event.reply_token, notice, incident_id, group_id, text
             )
