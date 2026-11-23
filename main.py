@@ -906,17 +906,91 @@ async def callback(request: Request):
 
         # 119：直接啟動，要求輸入事故地點
         if text == "119":
-            if group_id in active_incidents:
-                reply_text(event.reply_token, "⚠️ 目前已有進行中的救護事件，請先由最高管理者結束現有事件。")
-            elif group_id in pending_locations:
-                reply_text(event.reply_token, "目前已有啟動流程正在等待事故地點，請直接輸入事故地點。")
-            else:
-                pending = {"initiator": user_id,
-                           "initiator_name": get_display_name(group_id, user_id),
-                           "created_at": now_tw()}
-                pending_locations[group_id] = pending
-                schedule_timeout("location", group_id, pending["created_at"])
-                reply_text(event.reply_token, "🚨【緊急救護啟動】\n請直接輸入事故地點；收到地點後將立即建立救護事件並通知全群。")
+    if groupid in active_incidents:
+        reply_text(
+            event.reply_token,
+            "🚨 目前已有進行中的 119 事件，請先完成或關閉事件。"
+        )
+    elif groupid in pending_locations:
+        reply_text(
+            event.reply_token,
+            "⏳ 已在等待輸入地點，請直接輸入地點，或點擊「取消通報」。"
+        )
+    else:
+        pending = {
+            "initiator": userid,
+            "initiator_name": get_display_name(groupid, userid),
+            "created_at": now_tw(),
+        }
+        pending_locations[groupid] = pending
+        schedule_timeout("location", groupid, pending["created_at"])
+
+        location_prompt = flex_message(
+            "119 通報：請輸入地點，或點擊取消",
+            {
+                "type": "bubble",
+                "size": "kilo",
+                "body": {
+                    "type": "box",
+                    "layout": "vertical",
+                    "spacing": "md",
+                    "paddingAll": "20px",
+                    "backgroundColor": "#FFF8E1",
+                    "contents": [
+                        {
+                            "type": "text",
+                            "text": "🚨 緊急通報 🚨",
+                            "weight": "bold",
+                            "size": "xl",
+                            "color": "#D84315",
+                            "align": "center"
+                        },
+                        {
+                            "type": "text",
+                            "text": "請輸入事件地點！",
+                            "size": "md",
+                            "weight": "bold",
+                            "color": "#4E342E",
+                            "align": "center",
+                            "margin": "md"
+                        },
+                        {
+                            "type": "text",
+                            "text": "5 分鐘內未輸入將自動取消。",
+                            "size": "xs",
+                            "color": "#6D4C41",
+                            "align": "center",
+                            "margin": "md"
+                        }
+                    ]
+                },
+                "footer": {
+                    "type": "box",
+                    "layout": "vertical",
+                    "spacing": "sm",
+                    "paddingAll": "14px",
+                    "backgroundColor": "#FFE0B2",
+                    "contents": [
+                        {
+                            "type": "button",
+                            "style": "primary",
+                            "color": "#FF7043",
+                            "height": "md",
+                            "action": postback(
+                                label="取消通報",
+                                data="action=cancelstart",
+                                display_text="已取消 119 通報"
+                            )
+                        }
+                    ]
+                }
+            }
+        )
+
+        line_bot_api.reply_message(
+            event.reply_token,
+            location_prompt
+        )
             continue
 
         # 隨時重新叫出目前事件的救護回報卡片，避免原卡片被群組訊息洗版。
