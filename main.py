@@ -1,6 +1,7 @@
 import os
 import asyncio
 import json
+import uuid
 import urllib.request
 from datetime import datetime, timezone, timedelta
 from urllib.parse import parse_qs
@@ -353,6 +354,46 @@ def panel_message():
     return flex_message("廠區緊急救護面板", contents)
 
 
+def pending_location_message(token):
+    """啟動等待提示；取消按鈕使用本次流程專屬 Token，且不在群組顯示按鈕文字。"""
+    contents = {
+        "type": "bubble",
+        "size": "kilo",
+        "body": {
+            "type": "box",
+            "layout": "vertical",
+            "spacing": "md",
+            "contents": [
+                {
+                    "type": "text",
+                    "text": "🚨【緊急救護啟動】",
+                    "weight": "bold",
+                    "size": "lg",
+                    "color": "#B42318",
+                    "wrap": True
+                },
+                {
+                    "type": "text",
+                    "text": "請直接輸入事故地點；收到地點後將立即建立救護事件並通知全群。等待時間為 5 分鐘。",
+                    "size": "sm",
+                    "wrap": True
+                },
+                {
+                    "type": "button",
+                    "style": "secondary",
+                    "height": "md",
+                    "action": {
+                        "type": "postback",
+                        "label": "取消啟動",
+                        "data": f"action=cancel_start&token={token}"
+                    }
+                }
+            ]
+        }
+    }
+    return flex_message("緊急救護啟動等待中", contents)
+
+
 def schedule_timeout(kind, group_id, created_at):
     key = (kind, group_id)
     old_task = timeout_tasks.get(key)
@@ -394,107 +435,97 @@ def expire_if_needed(kind, group_id):
     return False
 
 
-def response_message_contents(incident_id, location=""):
-    """緊急救護回報 Flex 卡片；保留原有 Postback 回報資料。"""
-    location_text = str(location or "事故地點未提供")
+def response_message_contents(incident_id):
     return {
         "type": "bubble",
-        "size": "kilo",
-        "header": {
-            "type": "box", "layout": "vertical", "backgroundColor": "#B42318",
-            "paddingAll": "18px", "spacing": "sm", "contents": [
-                {"type": "text", "text": "🚨 緊急救護通知", "weight": "bold",
-                 "size": "xl", "color": "#FFFFFF", "wrap": True},
-                {"type": "text", "text": "請立即確認是否能前往支援",
-                 "size": "sm", "color": "#FFFFFF", "wrap": True}
-            ]
-        },
-        "body": {
-            "type": "box", "layout": "vertical", "spacing": "md",
-            "paddingAll": "18px", "contents": [
-                {"type": "box", "layout": "vertical", "backgroundColor": "#FCE7E7",
-                 "cornerRadius": "12px", "paddingAll": "16px", "spacing": "sm", "contents": [
-                    {"type": "text", "text": "📍 事故地點", "size": "sm",
-                     "weight": "bold", "color": "#991B1B"},
-                    {"type": "text", "text": location_text, "size": "xxl",
-                     "weight": "bold", "color": "#991B1B", "wrap": True}
-                ]},
-                {"type": "text", "text": "請選擇您的支援狀況", "size": "md",
-                 "weight": "bold", "wrap": True, "margin": "sm"},
-                {"type": "button", "style": "primary", "color": "#16834A",
-                 "height": "md", "action": postback(
-                     "可前往", f"action=ack_available&incident_id={incident_id}")},
-                {"type": "button", "style": "secondary", "color": "#64748B",
-                 "height": "md", "action": postback(
-                     "無法前往", f"action=ack_unavailable&incident_id={incident_id}")}
-            ]
-        },
-        "footer": {
-            "type": "box", "layout": "vertical", "paddingAll": "12px",
-            "backgroundColor": "#F3F4F6", "contents": [
-                {"type": "text",
-                 "text": "卡片若被洗版，輸入「救護回報」即可重新叫出。",
-                 "size": "xs", "color": "#667085", "wrap": True}
-            ]
-        }
+        "body": {"type": "box", "layout": "vertical", "spacing": "md", "contents": [
+            {"type": "text", "text": "救護人員回報", "weight": "bold", "size": "lg"},
+            {"type": "text", "text": "請所有群組成員依目前狀況選擇，之後可再次修改。", "wrap": True, "size": "sm"},
+            {"type": "button", "style": "primary", "color": "#16834A", "height": "md",
+             "action": postback("可前往", f"action=ack_available&incident_id={incident_id}")},
+            {"type": "button", "style": "secondary", "color": "#B3261E", "height": "md",
+             "action": postback("無法前往", f"action=ack_unavailable&incident_id={incident_id}")}
+        ]}
     }
 
 
-def response_message(incident_id, location=""):
+def response_message(incident_id):
     return flex_message(
-        "緊急救護通知－請回報是否可前往支援",
-        response_message_contents(incident_id, location)
+        "請回報是否可以前往支援",
+        response_message_contents(incident_id)
     )
 
 
 # ============================================================
 # LINE 群組真正的 @All 通知
 # ============================================================
-def reply_emergency_notice(reply_token, notice, incident_id, group_id, notice_location=""):
-    """保留已測試的真正 @All 通知及 Flex 卡片；Reply 失敗改用 Push。"""
-    flex_contents = response_message_contents(incident_id, notice_location)
+def reply_emergency_notice(reply_token, notice, incident_id, group_id):
+    """先發送真正 @All 文字通知，再獨立 Push Flex 回報卡片。"""
     def send(url, payload):
         request = urllib.request.Request(
-            url, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-            headers={"Content-Type": "application/json",
-                     "Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}"},
+            url,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}"
+            },
             method="POST"
         )
         with urllib.request.urlopen(request, timeout=10) as response:
             response.read()
-    reply_payload = {
+
+    # 第一則訊息：使用 Reply Token 發送真正的 LINE 全員提及。
+    text_payload = {
         "replyToken": reply_token,
-        "messages": [
-            {"type": "textV2", "text": "{everyone}\n" + notice,
-             "substitution": {"everyone": {"type": "mention", "mentionee": {"type": "all"}}}},
-            {"type": "flex", "altText": "請回報是否可以前往支援", "contents": flex_contents}
-        ]
+        "messages": [{
+            "type": "textV2",
+            "text": "{everyone}\n" + notice,
+            "substitution": {
+                "everyone": {
+                    "type": "mention",
+                    "mentionee": {"type": "all"}
+                }
+            }
+        }]
     }
+
     try:
-        send("https://api.line.me/v2/bot/message/reply", reply_payload)
-        print("緊急救護通知已透過 Reply API 發送真正 @All 及回報卡片。")
-        return
+        send("https://api.line.me/v2/bot/message/reply", text_payload)
+        print("真正 @All 文字通知已發送。")
     except Exception as error:
         body = error.read().decode("utf-8", errors="replace") if hasattr(error, "read") else str(error)
-        print(f"LINE Reply 發送失敗：{getattr(error, 'code', '未知')}；{body}")
-    push_payload = {
-        "to": group_id,
-        "messages": [
-            {"type": "textV2", "text": "{everyone}\n" + notice,
-             "substitution": {"everyone": {"type": "mention", "mentionee": {"type": "all"}}}},
-            {"type": "flex", "altText": "請回報是否可以前往支援", "contents": flex_contents}
-        ]
-    }
-    try:
-        send("https://api.line.me/v2/bot/message/push", push_payload)
-        print("緊急救護通知已改用 Push API 補送。")
-    except Exception as error:
-        body = error.read().decode("utf-8", errors="replace") if hasattr(error, "read") else str(error)
-        print(f"Push @All 失敗：{getattr(error, 'code', '未知')}；{body}")
+        print(f"LINE @All Reply 發送失敗：{getattr(error, 'code', '未知')}；{body}")
+
+        # Reply 失敗時，改用 Push 補送真正 @All 文字通知。
+        push_text_payload = {
+            "to": group_id,
+            "messages": [{
+                "type": "textV2",
+                "text": "{everyone}\n" + notice,
+                "substitution": {
+                    "everyone": {
+                        "type": "mention",
+                        "mentionee": {"type": "all"}
+                    }
+                }
+            }]
+        }
         try:
-            line_bot_api.push_message(group_id, [TextSendMessage(text=notice), response_message(incident_id, notice_location)])
-        except Exception as fallback_error:
-            print(f"一般 Push 補送失敗：{fallback_error}")
+            send("https://api.line.me/v2/bot/message/push", push_text_payload)
+            print("真正 @All 文字通知已透過 Push 補送。")
+        except Exception as push_error:
+            body = push_error.read().decode("utf-8", errors="replace") if hasattr(push_error, "read") else str(push_error)
+            print(f"Push @All 文字通知失敗：{getattr(push_error, 'code', '未知')}；{body}")
+
+    # 第二則訊息：獨立發送 Flex 回報卡片，不與 @All 文字合併。
+    try:
+        line_bot_api.push_message(
+            group_id,
+            response_message(incident_id)
+        )
+        print("緊急救護 Flex 回報卡片已獨立發送。")
+    except Exception as error:
+        print(f"Flex 回報卡片 Push 發送失敗：{error}")
 
 
 # ============================================================
@@ -536,16 +567,10 @@ def finish_incident(group_id, incident_id, end_type, notify_group=True):
 
     # 群組只通知事件已結束，不顯示完整報告。
     if notify_group:
-        report_notice = (
-            "完整結束報告已傳送至最高管理者私訊。"
-            if report_sent else
-            "⚠️ 完整結束報告私訊傳送失敗，請最高管理者確認機器人私訊功能。"
-        )
         group_notice = (
             "✅【救護事件已結束】\n"
             f"事件編號：{incident_id}\n"
-            f"結束方式：{end_type}\n"
-            f"{report_notice}"
+            f"結束方式：{end_type}"
         )
         try:
             line_bot_api.push_message(group_id, TextSendMessage(text=group_notice))
@@ -773,7 +798,7 @@ async def callback(request: Request):
                             group_id, incident = current[0]
                             incident_id = incident["id"]
                             if finish_incident(group_id, incident_id, "最高管理者人工結束"):
-                                reply_text(event.reply_token, f"已立即結束救護事件 {incident_id}。系統已嘗試將完整結束報告傳送至最高管理者私訊，原救護群組僅收到簡短結束通知。")
+                                reply_text(event.reply_token, f"已立即結束救護事件 {incident_id}。")
                             else:
                                 reply_text(event.reply_token, "事件結束失敗，資料庫狀態未變更，請稍後再試。")
                     elif text == "系統狀態":
@@ -835,9 +860,8 @@ async def callback(request: Request):
                     continue
                 incident["responses"][user_id] = record
 
-                # 成功保存後不使用 reply_token 回覆群組，避免公開顯示個人回報結果。
-                # 僅在符合條件的「可前往」回報時，另行推播群組通知。
-                # 無法前往僅保存於資料庫，供事件結束報告彙整。
+                # 成功回報不另外回覆群組；無法前往僅保存狀態與歷程。
+                # 可前往時才依原有規則通知群組。
                 # 從無法前往改為可前往，也會再次通知最新狀態。
                 if status == "available" and old_status != "available":
                     try:
@@ -850,34 +874,88 @@ async def callback(request: Request):
                 continue
 
             if action == "start_emergency":
-                # 舊版面板仍可用；按下後直接進入等候地點，不再提供取消確認卡片。
                 if group_id in active_incidents:
                     reply_text(event.reply_token, "⚠️ 目前已有進行中的救護事件，請先由最高管理者結束現有事件。")
                 elif group_id in pending_locations:
                     reply_text(event.reply_token, "目前已有啟動流程正在等待事故地點。")
                 else:
-                    pending = {"initiator": user_id,
-                               "initiator_name": get_display_name(group_id, user_id),
-                               "created_at": now_tw()}
+                    pending = {
+                        "initiator": user_id,
+                        "initiator_name": get_display_name(group_id, user_id),
+                        "created_at": now_tw(),
+                        "token": uuid.uuid4().hex
+                    }
                     pending_locations[group_id] = pending
                     schedule_timeout("location", group_id, pending["created_at"])
-                    reply_text(event.reply_token, "🚨 請直接輸入事故地點；收到地點後將立即建立救護事件並通知全群。")
+                    line_bot_api.reply_message(
+                        event.reply_token,
+                        pending_location_message(pending["token"])
+                    )
                 continue
 
             # 停用舊版護理/工安登記及結束確認按鈕。
             if action.startswith(("admin_", "register_", "ack_nurse_", "ack_safety_", "confirm_close", "cancel_close")):
                 reply_text(event.reply_token, "此為舊版功能按鈕，已停用。請使用最新救護事件流程。")
                 continue
-            if action in ("cancel_start", "cancel_correction"):
-                if action == "cancel_start":
-                    pending_locations.pop(group_id, None)
-                    task = timeout_tasks.pop(("location", group_id), None)
-                else:
-                    pending_corrections.pop(group_id, None)
-                    task = timeout_tasks.pop(("correction", group_id), None)
+
+            if action == "cancel_start":
+                pending = pending_locations.get(group_id)
+                token = data.get("token", [""])[0]
+
+                if not pending:
+                    reply_text(event.reply_token, "此取消按鈕已失效，沒有等待中的啟動流程。")
+                    continue
+
+                if not token or token != pending.get("token"):
+                    reply_text(event.reply_token, "此取消按鈕已失效，可能屬於先前的啟動流程。")
+                    continue
+
+                if user_id != pending.get("initiator") and not is_admin(user_id):
+                    reply_text(event.reply_token, "⛔ 僅原始啟動者或最高管理者可以取消啟動流程。")
+                    continue
+
+                initiator_name = pending.get("initiator_name", "未知")
+                operator_name = get_display_name(group_id, user_id)
+                cancelled_at = now_tw()
+
+                # 先清除等待狀態並停止逾時計時；取消不建立事件、不產生流水號。
+                pending_locations.pop(group_id, None)
+                task = timeout_tasks.pop(("location", group_id), None)
                 if task and not task.done():
                     task.cancel()
-                reply_text(event.reply_token, "已取消目前等待流程。")
+
+                try:
+                    group_name = line_bot_api.get_group_summary(group_id).group_name
+                except Exception:
+                    group_name = "無法取得群組名稱"
+
+                cancel_notice = (
+                    "❎【緊急救護啟動已取消】\n"
+                    f"群組名稱：{group_name}\n"
+                    f"群組 ID：{group_id}\n"
+                    f"原始啟動者：{initiator_name}\n"
+                    f"取消操作者：{operator_name}\n"
+                    f"取消時間：{time_text(cancelled_at)}\n"
+                    "事件編號：未建立"
+                )
+                try:
+                    line_bot_api.push_message(
+                        ADMIN_USER_ID,
+                        TextSendMessage(text=cancel_notice)
+                    )
+                    print(f"救護啟動取消通知已私訊最高管理者；群組：{group_id}")
+                except Exception as error:
+                    print(f"救護啟動已取消，但最高管理者私訊通知失敗；群組：{group_id}；錯誤：{error}")
+
+                # 成功取消不回覆群組；取消按鈕未設定 displayText，避免產生群組文字。
+                continue
+
+            if action == "cancel_correction":
+                pending_corrections.pop(group_id, None)
+                task = timeout_tasks.pop(("correction", group_id), None)
+                if task and not task.done():
+                    task.cancel()
+                reply_text(event.reply_token, "已取消目前事故地點修正流程。")
                 continue
 
         if not (isinstance(event, MessageEvent) and isinstance(event.message, TextMessage)):
@@ -906,91 +984,23 @@ async def callback(request: Request):
 
         # 119：直接啟動，要求輸入事故地點
         if text == "119":
-    if groupid in active_incidents:
-        reply_text(
-            event.reply_token,
-            "🚨 目前已有進行中的 119 事件，請先完成或關閉事件。"
-        )
-    elif groupid in pending_locations:
-        reply_text(
-            event.reply_token,
-            "⏳ 已在等待輸入地點，請直接輸入地點，或點擊「取消通報」。"
-        )
-    else:
-        pending = {
-            "initiator": userid,
-            "initiator_name": get_display_name(groupid, userid),
-            "created_at": now_tw(),
-        }
-        pending_locations[groupid] = pending
-        schedule_timeout("location", groupid, pending["created_at"])
-
-        location_prompt = flex_message(
-            "119 通報：請輸入地點，或點擊取消",
-            {
-                "type": "bubble",
-                "size": "kilo",
-                "body": {
-                    "type": "box",
-                    "layout": "vertical",
-                    "spacing": "md",
-                    "paddingAll": "20px",
-                    "backgroundColor": "#FFF8E1",
-                    "contents": [
-                        {
-                            "type": "text",
-                            "text": "🚨 緊急通報 🚨",
-                            "weight": "bold",
-                            "size": "xl",
-                            "color": "#D84315",
-                            "align": "center"
-                        },
-                        {
-                            "type": "text",
-                            "text": "請輸入事件地點！",
-                            "size": "md",
-                            "weight": "bold",
-                            "color": "#4E342E",
-                            "align": "center",
-                            "margin": "md"
-                        },
-                        {
-                            "type": "text",
-                            "text": "5 分鐘內未輸入將自動取消。",
-                            "size": "xs",
-                            "color": "#6D4C41",
-                            "align": "center",
-                            "margin": "md"
-                        }
-                    ]
-                },
-                "footer": {
-                    "type": "box",
-                    "layout": "vertical",
-                    "spacing": "sm",
-                    "paddingAll": "14px",
-                    "backgroundColor": "#FFE0B2",
-                    "contents": [
-                        {
-                            "type": "button",
-                            "style": "primary",
-                            "color": "#FF7043",
-                            "height": "md",
-                            "action": postback(
-                                label="取消通報",
-                                data="action=cancelstart",
-                                display_text="已取消 119 通報"
-                            )
-                        }
-                    ]
+            if group_id in active_incidents:
+                reply_text(event.reply_token, "⚠️ 目前已有進行中的救護事件，請先由最高管理者結束現有事件。")
+            elif group_id in pending_locations:
+                reply_text(event.reply_token, "目前已有啟動流程正在等待事故地點，請直接輸入事故地點。")
+            else:
+                pending = {
+                    "initiator": user_id,
+                    "initiator_name": get_display_name(group_id, user_id),
+                    "created_at": now_tw(),
+                    "token": uuid.uuid4().hex
                 }
-            }
-        )
-
-        line_bot_api.reply_message(
-            event.reply_token,
-            location_prompt
-        )
+                pending_locations[group_id] = pending
+                schedule_timeout("location", group_id, pending["created_at"])
+                line_bot_api.reply_message(
+                    event.reply_token,
+                    pending_location_message(pending["token"])
+                )
             continue
 
         # 隨時重新叫出目前事件的救護回報卡片，避免原卡片被群組訊息洗版。
@@ -1001,7 +1011,7 @@ async def callback(request: Request):
             else:
                 line_bot_api.reply_message(
                     event.reply_token,
-                    response_message(incident["id"], incident.get("location", ""))
+                    response_message(incident["id"])
                 )
             continue
 
@@ -1074,11 +1084,8 @@ async def callback(request: Request):
 
             active_incidents[group_id] = incident
             schedule_incident_timer(group_id, incident)
-            # @All 訊息僅保留簡短提示；事故資訊與操作說明統一呈現在 Flex 卡片。
             notice = "🚨 緊急救護通知，請回報支援狀況。"
-            reply_emergency_notice(
-                event.reply_token, notice, incident_id, group_id, text
-            )
+            reply_emergency_notice(event.reply_token, notice, incident_id, group_id)
             continue
 
     return "OK"
