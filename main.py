@@ -2,6 +2,7 @@ import os
 import asyncio
 import json
 import logging
+import re
 import threading
 import unicodedata
 import uuid
@@ -12,6 +13,7 @@ from datetime import datetime, timezone, timedelta
 from urllib.parse import parse_qs
 
 import psycopg
+from psycopg.errors import UniqueViolation
 from psycopg.rows import dict_row
 
 # 連線池為選用：requirements.txt 沒有 psycopg_pool 時自動退回「每次查詢新建連線」。
@@ -27,6 +29,7 @@ from linebot.models import (
     MessageEvent,
     PostbackEvent,
     JoinEvent,
+    FollowEvent,
     TextMessage,
     TextSendMessage,
     FlexSendMessage,
@@ -59,6 +62,18 @@ MAX_LOCATION_LENGTH = 300
 
 # Webhook 去重：保留最近處理過的事件識別碼數量
 DEDUP_CACHE_SIZE = 1000
+
+# 員工私訊通報：救護通知要推播到的群組。
+# 優先使用環境變數 RESCUE_GROUP_ID；未設定時，使用管理者在群組輸入「設定通報群組」所存的值。
+RESCUE_GROUP_ID_ENV = os.environ.get("RESCUE_GROUP_ID", "").strip()
+
+# 員工欄位格式限制
+EMP_NO_PATTERN = re.compile(r"^[A-Za-z0-9\-]{1,20}$")
+EXT_PATTERN = re.compile(r"^[0-9\-#]{1,10}$")
+MAX_NAME_LENGTH = 20
+
+# 員工申請填寫步驟的有效時間（通報地點步驟沿用 WAIT_SECONDS = 5 分鐘）
+REGISTRATION_STEP_TIMEOUT_SECONDS = 30 * 60
 
 # ============================================================
 # 暫存資料
@@ -219,6 +234,29 @@ def init_database():
             changed_at TIMESTAMPTZ NOT NULL
         )""",
         """ALTER TABLE incidents ADD COLUMN IF NOT EXISTS end_type TEXT""",
+        # 員工私訊通報：員工資料、申請狀態與對話步驟（存資料庫，Render 重啟或休眠後不會遺失）。
+        """CREATE TABLE IF NOT EXISTS employees (
+            line_user_id TEXT PRIMARY KEY,
+            emp_no TEXT,
+            name TEXT,
+            ext TEXT,
+            status TEXT NOT NULL DEFAULT 'draft'
+                CHECK (status IN ('draft', 'pending', 'approved', 'rejected', 'disabled')),
+            step TEXT,
+            step_at TIMESTAMPTZ,
+            applied_at TIMESTAMPTZ,
+            reviewed_at TIMESTAMPTZ,
+            reviewed_by TEXT,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""",
+        # 同一工號同時只能綁定一個「待核准或已核准」的 LINE 帳號。
+        """CREATE UNIQUE INDEX IF NOT EXISTS one_live_emp_no
+            ON employees(emp_no) WHERE status IN ('pending', 'approved')""",
+        """CREATE TABLE IF NOT EXISTS bot_config (
+            config_key TEXT PRIMARY KEY,
+            config_value TEXT NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""",
     ]
     with get_db_connection() as conn:
         with conn.cursor() as cur:
@@ -585,7 +623,9 @@ def response_message_contents(incident_id):
         (item["location"] for item in active_incidents.values() if item["id"] == incident_id),
         "請參閱上方緊急救護通知"
     )
-    return {
+    incident = next((item for item in active_incidents.values() if item["id"] == incident_id), None)
+    reporter = incident.get("initiator_name") if incident else None
+    contents = {
         "type": "bubble",
         "size": "mega",
         "header": {
@@ -630,6 +670,13 @@ def response_message_contents(incident_id):
             ]
         }
     }
+    # 顯示通報人（員工私訊通報時含工號、分機，方便現場聯絡）。
+    if reporter:
+        contents["body"]["contents"].insert(2, {
+            "type": "text", "text": f"通報人：{reporter}", "size": "sm",
+            "weight": "bold", "color": "#374151", "wrap": True
+        })
+    return contents
 
 
 def response_message(incident_id):
@@ -886,7 +933,12 @@ def build_admin_menu():
         "查詢目前事件：查詢所有群組進行中事件\n"
         "查詢救護事件 YYYYMMDD01：查詢指定事件完整資料\n"
         "結束救護事件：結束目前進行中的事件（可於私訊或救護群組操作）\n"
-        "系統狀態：查詢機器人及資料庫狀態"
+        "系統狀態：查詢機器人及資料庫狀態\n"
+        "待核准名單：顯示待核准的員工申請（附核准／拒絕按鈕）\n"
+        "員工名單：查詢員工申請與核准名單\n"
+        "停用員工 工號：停用已核准員工的通報權限\n"
+        "通報群組：查詢目前的救護通報群組\n"
+        "（在要接收通報的群組輸入「設定通報群組」即可設定）"
     )
 
 
@@ -959,6 +1011,448 @@ def start_emergency_flow(reply_token, group_id, user_id, already_pending_text):
 
 
 # ============================================================
+# 員工申請、核准與私訊通報
+# ============================================================
+EMP_HELP_TEXT = (
+    "【廠區救護通報機器人】\n"
+    "申請：申請通報權限（需填工號、姓名、分機，並經管理員核准）\n"
+    "119：緊急通報（限已核准員工），再輸入事故地點即可發出\n"
+    "我的資料：查詢申請狀態\n"
+    "取消：取消目前進行中的操作"
+)
+
+EMP_STATUS_TEXT = {
+    "draft": "尚未完成申請，請輸入「申請」重新填寫。",
+    "pending": "申請已送出，正在等待管理員核准。",
+    "approved": "已核准，可使用「119」通報。",
+    "rejected": "申請未獲核准，如有疑問請洽管理員；可輸入「申請」重新申請。",
+    "disabled": "通報權限已被停用，請洽管理員；可輸入「申請」重新申請。",
+}
+
+
+# ---------------- 資料庫 ----------------
+def get_config(key):
+    with get_db_connection() as conn:
+        row = conn.execute("SELECT config_value FROM bot_config WHERE config_key=%s", (key,)).fetchone()
+    return row["config_value"] if row else None
+
+
+def set_config(key, value):
+    with get_db_connection() as conn:
+        conn.execute(
+            "INSERT INTO bot_config (config_key, config_value) VALUES (%s, %s) "
+            "ON CONFLICT (config_key) DO UPDATE SET config_value=EXCLUDED.config_value, updated_at=NOW()",
+            (key, value),
+        )
+
+
+def get_rescue_group_id():
+    """通報群組：環境變數優先，其次為管理者在群組設定的值。"""
+    return RESCUE_GROUP_ID_ENV or get_config("rescue_group_id")
+
+
+def get_employee(user_id):
+    with get_db_connection() as conn:
+        return conn.execute("SELECT * FROM employees WHERE line_user_id=%s", (user_id,)).fetchone()
+
+
+def employee_update(user_id, **cols):
+    allowed = {"emp_no", "name", "ext", "status", "step", "step_at"}
+    if not cols or set(cols) - allowed:
+        raise ValueError("employee_update 欄位不合法")
+    sets = ", ".join(f"{key}=%s" for key in cols) + ", updated_at=NOW()"
+    with get_db_connection() as conn:
+        conn.execute(f"UPDATE employees SET {sets} WHERE line_user_id=%s", (*cols.values(), user_id))
+
+
+def employee_begin_application(user_id):
+    """開始（或重新）申請；僅 draft / rejected / disabled 或新帳號可開始。"""
+    with get_db_connection() as conn:
+        row = conn.execute(
+            "INSERT INTO employees (line_user_id, status, step, step_at) "
+            "VALUES (%s, 'draft', 'emp_no', NOW()) "
+            "ON CONFLICT (line_user_id) DO UPDATE SET status='draft', step='emp_no', step_at=NOW(), "
+            "emp_no=NULL, name=NULL, ext=NULL, applied_at=NULL, reviewed_at=NULL, "
+            "reviewed_by=NULL, updated_at=NOW() "
+            "WHERE employees.status IN ('draft', 'rejected', 'disabled') RETURNING line_user_id",
+            (user_id,),
+        ).fetchone()
+    return row is not None
+
+
+def emp_no_in_use(emp_no, user_id):
+    with get_db_connection() as conn:
+        row = conn.execute(
+            "SELECT 1 AS hit FROM employees WHERE emp_no=%s AND line_user_id<>%s "
+            "AND status IN ('pending', 'approved')",
+            (emp_no, user_id),
+        ).fetchone()
+    return row is not None
+
+
+def employee_submit(user_id):
+    """draft → pending；工號若被他人搶先使用，資料庫唯一索引會拋出 UniqueViolation。"""
+    with get_db_connection() as conn:
+        return conn.execute(
+            "UPDATE employees SET status='pending', step=NULL, step_at=NULL, "
+            "applied_at=NOW(), updated_at=NOW() "
+            "WHERE line_user_id=%s AND status='draft' "
+            "AND emp_no IS NOT NULL AND name IS NOT NULL AND ext IS NOT NULL RETURNING *",
+            (user_id,),
+        ).fetchone()
+
+
+def employee_review(user_id, new_status, reviewer):
+    """pending → approved / rejected；已處理過的申請回傳 None。"""
+    with get_db_connection() as conn:
+        return conn.execute(
+            "UPDATE employees SET status=%s, reviewed_at=NOW(), reviewed_by=%s, updated_at=NOW() "
+            "WHERE line_user_id=%s AND status='pending' RETURNING *",
+            (new_status, reviewer, user_id),
+        ).fetchone()
+
+
+def employee_disable_by_emp_no(emp_no):
+    with get_db_connection() as conn:
+        return conn.execute(
+            "UPDATE employees SET status='disabled', step=NULL, step_at=NULL, "
+            "reviewed_at=NOW(), reviewed_by=%s, updated_at=NOW() "
+            "WHERE emp_no=%s AND status='approved' RETURNING *",
+            (ADMIN_USER_ID, emp_no),
+        ).fetchone()
+
+
+def list_pending_employees(limit):
+    with get_db_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM employees WHERE status='pending' ORDER BY applied_at LIMIT %s", (limit,)
+        ).fetchall()
+
+
+def list_employees_text():
+    with get_db_connection() as conn:
+        rows = conn.execute(
+            "SELECT emp_no, name, ext, status FROM employees "
+            "WHERE status IN ('approved', 'pending', 'disabled') ORDER BY status, emp_no"
+        ).fetchall()
+    if not rows:
+        return "目前沒有員工資料。"
+    label = {"approved": "已核准", "pending": "待核准", "disabled": "已停用"}
+    lines = ["【員工名單】"]
+    lines.extend(f"{r['emp_no']}｜{r['name']}｜分機 {r['ext']}｜{label.get(r['status'], r['status'])}" for r in rows)
+    text = "\n".join(lines)
+    return text if len(text) <= 4500 else text[:4500] + "\n…（名單過長，已截斷）"
+
+
+# ---------------- 訊息 ----------------
+def employee_review_card(emp):
+    uid = emp["line_user_id"]
+    applied = time_text(emp["applied_at"]) if emp.get("applied_at") else "-"
+    contents = {
+        "type": "bubble", "size": "kilo",
+        "body": {"type": "box", "layout": "vertical", "spacing": "sm", "contents": [
+            {"type": "text", "text": "📝 救護通報權限申請", "weight": "bold", "size": "lg", "wrap": True},
+            {"type": "text", "text": f"工號：{emp['emp_no']}", "size": "sm", "wrap": True},
+            {"type": "text", "text": f"姓名：{emp['name']}", "size": "sm", "wrap": True},
+            {"type": "text", "text": f"分機：{emp['ext']}", "size": "sm", "wrap": True},
+            {"type": "text", "text": f"申請時間：{applied}", "size": "xs", "color": "#6B7280", "wrap": True},
+        ]},
+        "footer": {"type": "box", "layout": "horizontal", "spacing": "md", "contents": [
+            {"type": "button", "style": "primary", "color": "#16834A", "height": "sm",
+             "action": {"type": "postback", "label": "核准",
+                        "data": f"action=emp_review&decision=approve&uid={uid}"}},
+            {"type": "button", "style": "secondary", "height": "sm",
+             "action": {"type": "postback", "label": "拒絕",
+                        "data": f"action=emp_review&decision=reject&uid={uid}"}},
+        ]},
+    }
+    return flex_message("有新的員工通報申請", contents)
+
+
+def safe_notice_text(value):
+    """textV2 以 {key} 作為替換標記，使用者輸入的大括號需轉成全形，避免通知被誤判而發送失敗。"""
+    return str(value).replace("{", "｛").replace("}", "｝")
+
+
+def _line_post(url, payload):
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=10) as response:
+        response.read()
+
+
+def push_emergency_notice(group_id, notice, incident_id):
+    """員工私訊通報用：以 Push 將真正 @All 文字及 Flex 回報卡片一次推播到群組。
+    （私訊的 Reply Token 不能回覆到群組，所以只能 Push；群組推播依群組人數計入訊息額度。）"""
+    payload = {
+        "to": group_id,
+        "messages": [{
+            "type": "textV2",
+            "text": "{everyone}\n" + notice,
+            "substitution": {"everyone": {"type": "mention", "mentionee": {"type": "all"}}},
+        }, {
+            "type": "flex",
+            "altText": "請回報是否可以前往支援",
+            "contents": response_message_contents(incident_id),
+        }],
+    }
+    try:
+        _line_post("https://api.line.me/v2/bot/message/push", payload)
+        logger.info("私訊通報：@All 通知及回報卡片已推播到群組：%s", incident_id)
+        return True
+    except Exception as error:
+        body = error.read().decode("utf-8", errors="replace") if hasattr(error, "read") else str(error)
+        logger.error("私訊通報 @All Push 失敗：%s；%s", getattr(error, "code", "未知"), body)
+
+    # 備援：不含 @All 的一般推播（至少讓群組看到地點與回報卡片）。
+    try:
+        line_bot_api.push_message(
+            group_id,
+            [TextSendMessage(text="🚨 " + notice.replace("{", "").replace("}", "")),
+             response_message(incident_id)],
+        )
+        logger.info("私訊通報：改用一般 Push 補送成功：%s", incident_id)
+        return True
+    except Exception as error:
+        logger.error("私訊通報：備援 Push 也失敗：%s", error)
+
+    alert_admin(
+        "⚠️【私訊通報：群組通知發送失敗】\n"
+        f"事件編號：{incident_id}\n"
+        f"群組 ID：{group_id}\n"
+        "事件已建立並進行中，請立即以其他方式通知現場人員。\n"
+        "常見原因：LINE 官方帳號當月訊息額度已用完。"
+    )
+    return False
+
+
+# ---------------- 流程 ----------------
+def _employee_summary(emp_no, name, ext):
+    return f"工號：{emp_no}\n姓名：{name}\n分機：{ext}"
+
+
+def start_application(token, user_id, emp):
+    status = emp["status"] if emp else None
+    if status == "approved":
+        reply_text(token, "您已通過核准，可直接使用「119」通報。\n"
+                          f"{_employee_summary(emp['emp_no'], emp['name'], emp['ext'])}\n"
+                          "如需更改資料，請洽管理員。")
+    elif status == "pending":
+        reply_text(token, "您的申請已送出，正在等待管理員核准。")
+    elif employee_begin_application(user_id):
+        reply_text(token, "請輸入您的工號（英數字，例如 A12345）。\n輸入「取消」可中止申請。")
+    else:
+        reply_text(token, "目前無法申請，請洽管理員。")
+
+
+def submit_application(token, user_id):
+    try:
+        row = employee_submit(user_id)
+    except UniqueViolation:
+        employee_update(user_id, step=None, step_at=None)
+        reply_text(token, "此工號剛被其他 LINE 帳號申請或核准，請輸入「申請」重新填寫並確認工號。")
+        return
+    if not row:
+        reply_text(token, "申請狀態已變更，請輸入「我的資料」查看。")
+        return
+    notified = True
+    try:
+        line_bot_api.push_message(ADMIN_USER_ID, employee_review_card(row))
+    except Exception:
+        notified = False
+        logger.exception("新員工申請通知管理員失敗：%s", row["emp_no"])
+    reply_text(token, "✅ 申請已送出，待管理員核准後會通知您。"
+                      + ("" if notified else "\n（系統通知管理員失敗，請另行聯絡管理員。）"))
+
+
+def handle_application_step(token, user_id, emp, step, cmd, text):
+    if step == "emp_no":
+        emp_no = cmd.upper()
+        if not EMP_NO_PATTERN.match(emp_no):
+            reply_text(token, "工號格式不正確，請輸入英數字（可含 -），最長 20 字元。")
+        elif emp_no_in_use(emp_no, user_id):
+            reply_text(token, "此工號已有其他 LINE 帳號申請或使用中，請確認工號是否正確。\n"
+                              "若是更換 LINE 帳號，請洽管理員停用舊帳號後再申請。")
+        else:
+            employee_update(user_id, emp_no=emp_no, step="name", step_at=now_tw())
+            reply_text(token, "請輸入您的姓名。")
+    elif step == "name":
+        name = " ".join(text.split())
+        if not name or len(name) > MAX_NAME_LENGTH:
+            reply_text(token, f"姓名請輸入 1～{MAX_NAME_LENGTH} 個字。")
+        else:
+            employee_update(user_id, name=name, step="ext", step_at=now_tw())
+            reply_text(token, "請輸入您的分機號碼（數字，可含 - 或 #）。")
+    elif step == "ext":
+        if not EXT_PATTERN.match(cmd):
+            reply_text(token, "分機格式不正確，請輸入數字（可含 - 或 #），最長 10 字元。")
+        else:
+            employee_update(user_id, ext=cmd, step="confirm", step_at=now_tw())
+            reply_text(token, "請確認申請資料：\n"
+                              f"{_employee_summary(emp['emp_no'], emp['name'], cmd)}\n\n"
+                              "資料正確請回覆「確認」送出申請，要中止請回覆「取消」。")
+    elif step == "confirm":
+        if cmd in ("確認", "確認送出"):
+            submit_application(token, user_id)
+        else:
+            reply_text(token, "請確認申請資料：\n"
+                              f"{_employee_summary(emp['emp_no'], emp['name'], emp['ext'])}\n\n"
+                              "資料正確請回覆「確認」送出申請，要中止請回覆「取消」。")
+
+
+def begin_report(token, user_id, emp):
+    status = emp["status"] if emp else None
+    if status != "approved":
+        reply_text(token, "您尚未通過通報權限核准。\n"
+                          + (EMP_STATUS_TEXT.get(status, "") if status else "請先輸入「申請」。"))
+        return
+    group_id = get_rescue_group_id()
+    if not group_id:
+        reply_text(token, "⚠️ 尚未設定救護通報群組，請立即改用電話通知，並聯絡管理員設定。")
+    elif group_id in active_incidents:
+        reply_text(token, "⚠️ 目前已有進行中的救護事件，群組已收到通知，請至群組查看並回報。")
+    elif group_id in pending_locations:
+        reply_text(token, "⚠️ 群組內正在進行救護啟動流程，請至群組輸入事故地點。")
+    else:
+        employee_update(user_id, step="await_location", step_at=now_tw())
+        reply_text(token, "🚨 請直接輸入事故地點，收到後將立即通知救護群組（5 分鐘內有效）。\n輸入「取消」可取消。")
+
+
+def submit_report(token, user_id, emp, text):
+    employee_update(user_id, step=None, step_at=None)
+    if emp["status"] != "approved":
+        reply_text(token, "您的通報權限已變更，無法通報。請洽管理員。")
+        return
+    group_id = get_rescue_group_id()
+    if not group_id:
+        reply_text(token, "⚠️ 尚未設定救護通報群組，請立即改用電話通知，並聯絡管理員設定。")
+        return
+    if group_id in active_incidents:
+        reply_text(token, "⚠️ 目前已有進行中的救護事件，群組已收到通知，請至群組查看並回報。")
+        return
+    if group_id in pending_locations:
+        reply_text(token, "⚠️ 群組內正在進行救護啟動流程，請至群組輸入事故地點。")
+        return
+
+    location = clip_location(text)
+    reporter = f"{emp['name']}（工號 {emp['emp_no']}／分機 {emp['ext']}）"
+    incident_id = next_incident_id()
+    incident = {
+        "id": incident_id, "location": location,
+        "initiator": user_id, "initiator_name": reporter,
+        "created_at": now_tw(), "responses": {},
+    }
+    try:
+        create_incident_record(incident, group_id)
+    except Exception as error:
+        logger.error("私訊通報：救護事件寫入資料庫失敗：%s", error)
+        reply_text(token, "⚠️ 救護事件資料保存失敗，未發送通知！請立即改用電話通知，或稍後重新輸入「119」。")
+        return
+
+    active_incidents[group_id] = incident
+    schedule_incident_timer(group_id, incident)
+    notice = (f"🚨 緊急救護通知，請回報支援狀況。\n"
+              f"通報人：{safe_notice_text(reporter)}\n"
+              f"事故地點：{safe_notice_text(location)}")
+    if push_emergency_notice(group_id, notice, incident_id):
+        reply_text(token, f"✅ 已通知救護群組。\n事件編號：{incident_id}\n事故地點：{location}")
+    else:
+        reply_text(token, f"⚠️ 事件 {incident_id} 已建立，但群組通知發送失敗（可能是訊息額度已用完）。\n"
+                          "請立即改用電話或其他方式通知現場人員！")
+
+
+def handle_employee_dm(event, user_id, cmd, text):
+    """員工私訊：申請與通報流程。回傳 True 表示已處理（並已回覆）。"""
+    if not user_id:
+        return False
+    token = event.reply_token
+    emp = get_employee(user_id)
+    expired_notice = ""
+    if emp and emp["step"]:
+        limit = WAIT_SECONDS if emp["step"] == "await_location" else REGISTRATION_STEP_TIMEOUT_SECONDS
+        started = emp["step_at"]
+        if started is None or (now_tw() - started.astimezone(TAIWAN_TZ)).total_seconds() > limit:
+            employee_update(user_id, step=None, step_at=None)
+            emp = {**emp, "step": None}
+            expired_notice = "⌛ 上一個操作已逾時取消。\n"
+    step = emp["step"] if emp else None
+
+    if cmd == "取消":
+        if step:
+            employee_update(user_id, step=None, step_at=None)
+            reply_text(token, "已取消目前操作。")
+            return True
+    elif step == "await_location":
+        submit_report(token, user_id, emp, text)
+        return True
+    elif step in ("emp_no", "name", "ext", "confirm"):
+        handle_application_step(token, user_id, emp, step, cmd, text)
+        return True
+
+    if cmd in ("申請", "註冊"):
+        start_application(token, user_id, emp)
+        return True
+    if cmd in ("119", "通報", "緊急通報"):
+        begin_report(token, user_id, emp)
+        return True
+    if cmd in ("我的資料", "查詢申請", "申請狀態"):
+        if not emp:
+            reply_text(token, "您尚未申請，請輸入「申請」。")
+        else:
+            info = (_employee_summary(emp["emp_no"], emp["name"], emp["ext"]) + "\n") if emp.get("emp_no") else ""
+            reply_text(token, info + EMP_STATUS_TEXT.get(emp["status"], emp["status"]))
+        return True
+
+    if is_admin(user_id):
+        return False  # 交給管理者私訊模式處理
+    reply_text(token, expired_notice + EMP_HELP_TEXT)
+    return True
+
+
+def is_admin_dm_command(cmd):
+    return (cmd in ("管理選單", "查詢目前事件", "結束救護事件", "系統狀態", "待核准名單", "員工名單", "通報群組")
+            or cmd.startswith(("查詢救護事件 ", "停用員工 ")))
+
+
+def handle_dm_postback(event, user_id):
+    """私訊中的按鈕：管理者核准或拒絕員工申請。"""
+    data = parse_qs(getattr(event.postback, "data", ""))
+    if data.get("action", [""])[0] != "emp_review":
+        return
+    token = event.reply_token
+    if not is_admin(user_id):
+        reply_text(token, "⛔ 僅最高管理者可以核准或拒絕申請。")
+        return
+    decision = data.get("decision", [""])[0]
+    uid = data.get("uid", [""])[0]
+    if decision not in ("approve", "reject") or not uid:
+        reply_text(token, "按鈕資料不正確。")
+        return
+    approved = decision == "approve"
+    try:
+        row = employee_review(uid, "approved" if approved else "rejected", user_id)
+    except UniqueViolation:
+        reply_text(token, "核准失敗：此工號已有其他帳號核准使用中。")
+        return
+    if not row:
+        reply_text(token, "此申請已處理過或不存在。")
+        return
+    reply_text(token, f"已{'核准' if approved else '拒絕'}：{row['name']}"
+                      f"（工號 {row['emp_no']}／分機 {row['ext']}）")
+    message = ("✅ 您的救護通報申請已核准。\n緊急時請私訊本機器人輸入「119」，再輸入事故地點即可通報。"
+               if approved else "❌ 您的救護通報申請未獲核准，如有疑問請洽管理員。")
+    try:
+        line_bot_api.push_message(uid, TextSendMessage(text=message))
+    except Exception as error:
+        logger.error("申請結果通知員工失敗：%s；%s", row["emp_no"], error)
+
+
+# ============================================================
 # Webhook 事件處理（同步；於背景執行緒依序執行）
 # ============================================================
 def handle_event(event):
@@ -968,6 +1462,17 @@ def handle_event(event):
 
     if isinstance(event, JoinEvent) and group_id:
         line_bot_api.reply_message(event.reply_token, panel_message())
+        return
+
+    # 員工加機器人為好友：回覆使用說明（Reply 不耗額度）。
+    if isinstance(event, FollowEvent) and source_type == "user":
+        reply_text(event.reply_token, "歡迎使用廠區救護通報機器人。\n\n" + EMP_HELP_TEXT)
+        return
+
+    # 私訊按鈕：管理者核准／拒絕員工申請。
+    if isinstance(event, PostbackEvent) and not group_id:
+        if source_type == "user":
+            handle_dm_postback(event, user_id)
         return
 
     is_text = isinstance(event, MessageEvent) and isinstance(event.message, TextMessage)
@@ -982,8 +1487,36 @@ def handle_event(event):
             if source_type != "user":
                 reply_text(event.reply_token, "管理功能僅能在與救護機器人的一對一私訊中執行。")
                 return
+            # 員工申請／通報流程（管理者也可申請與通報）；管理指令優先，不會被申請步驟吃掉。
+            if not (is_admin(user_id) and is_admin_dm_command(cmd)):
+                if handle_employee_dm(event, user_id, cmd, text):
+                    return
             if is_admin(user_id):
-                if cmd == "管理選單":
+                if cmd == "待核准名單":
+                    pending_rows = list_pending_employees(6)
+                    if not pending_rows:
+                        reply_text(event.reply_token, "目前沒有待核准的申請。")
+                    else:
+                        if len(pending_rows) > 5:
+                            messages = [employee_review_card(r) for r in pending_rows[:4]]
+                            messages.append(TextSendMessage(text="尚有更多待核准申請，處理完畢後請再輸入「待核准名單」。"))
+                        else:
+                            messages = [employee_review_card(r) for r in pending_rows]
+                        line_bot_api.reply_message(event.reply_token, messages)
+                elif cmd == "員工名單":
+                    reply_text(event.reply_token, list_employees_text())
+                elif cmd.startswith("停用員工 "):
+                    emp_no = cmd.replace("停用員工 ", "", 1).strip().upper()
+                    disabled = employee_disable_by_emp_no(emp_no)
+                    reply_text(event.reply_token,
+                               f"已停用：{disabled['name']}（工號 {disabled['emp_no']}），該員工將無法再通報。" if disabled
+                               else "查無此工號的已核准員工。")
+                elif cmd == "通報群組":
+                    current_group = get_rescue_group_id()
+                    reply_text(event.reply_token,
+                               f"目前救護通報群組：{current_group}" if current_group
+                               else "尚未設定通報群組。請管理者在要接收通知的群組輸入「設定通報群組」。")
+                elif cmd == "管理選單":
                     reply_text(event.reply_token, build_admin_menu())
                 elif cmd == "查詢目前事件":
                     reply_text(event.reply_token, query_active_incidents_text())
@@ -1032,6 +1565,18 @@ def handle_event(event):
                        "啟動工安人員登記", "關閉工安人員登記", "重設護理人員名單", "重設工安人員名單")
         ):
             reply_text(event.reply_token, "⛔ 最高管理者管理指令僅能在與救護機器人的一對一私訊中執行。")
+            return
+
+        # 在群組輸入「設定通報群組」：把本群組設為員工私訊通報的推播目標（僅最高管理者）。
+        if group_id and cmd == "設定通報群組":
+            if not is_admin(user_id):
+                reply_text(event.reply_token, "⛔ 僅最高管理者可以設定通報群組。")
+            else:
+                set_config("rescue_group_id", group_id)
+                note = ""
+                if RESCUE_GROUP_ID_ENV and RESCUE_GROUP_ID_ENV != group_id:
+                    note = "\n⚠️ 注意：Render 已設定環境變數 RESCUE_GROUP_ID 且與本群組不同，實際仍以環境變數為準。"
+                reply_text(event.reply_token, "✅ 已將本群組設為救護通報群組，員工私訊通報時會通知本群組。" + note)
             return
 
     if not group_id:
