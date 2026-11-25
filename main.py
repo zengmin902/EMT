@@ -69,7 +69,7 @@ RESCUE_GROUP_ID_ENV = os.environ.get("RESCUE_GROUP_ID", "").strip()
 
 # 員工欄位格式限制
 EMP_NO_PATTERN = re.compile(r"^[A-Za-z0-9\-]{1,20}$")
-EXT_PATTERN = re.compile(r"^[0-9\-#]{1,10}$")
+EXT_PATTERN = re.compile(r"^[0-9]{1,10}$")
 MAX_NAME_LENGTH = 20
 
 # 員工申請填寫步驟的有效時間（通報地點步驟沿用 WAIT_SECONDS = 5 分鐘）
@@ -83,6 +83,7 @@ pending_locations = {}
 pending_corrections = {}
 active_incidents = {}
 pending_closures = {}
+pending_employee_confirmations = {}  # 員工私訊確認卡，5 分鐘有效；不建立資料庫事件
 timeout_tasks = {}
 
 # 每個群組各自的救護事件定時任務
@@ -434,6 +435,36 @@ def load_persistent_state():
 
 def now_tw():
     return datetime.now(TAIWAN_TZ)
+
+
+SERVICE_TIME_MESSAGE = "⏰ 目前非救護通報服務時間（週一至週五 08:00～17:00），請撥打緊急電話 8119。"
+
+
+def _env_date_set(name):
+    """讀取 Render 環境變數中的 YYYY-MM-DD 日期清單（逗號分隔）。"""
+    values = set()
+    for raw in os.environ.get(name, "").split(","):
+        value = raw.strip()
+        if not value:
+            continue
+        try:
+            values.add(datetime.strptime(value, "%Y-%m-%d").date())
+        except ValueError:
+            logger.warning("環境變數 %s 含有無效日期：%s（應為 YYYY-MM-DD）", name, value)
+    return values
+
+
+def is_rescue_service_time(moment=None):
+    """週一至週五 08:00:00–16:59:59；國定/補休日可由環境變數調整。"""
+    moment = (moment or now_tw()).astimezone(TAIWAN_TZ)
+    day = moment.date()
+    makeup_days = _env_date_set("MAKEUP_WORKDAYS")
+    holidays = _env_date_set("HOLIDAY_DATES")
+    if day in makeup_days:
+        is_workday = True  # 明確補班日優先於週末或 HOLIDAY_DATES
+    else:
+        is_workday = moment.weekday() < 5 and day not in holidays
+    return is_workday and moment.time() >= datetime.strptime("08:00:00", "%H:%M:%S").time() and moment.time() < datetime.strptime("17:00:00", "%H:%M:%S").time()
 
 
 def next_incident_id():
@@ -991,7 +1022,9 @@ def reply_text(reply_token, text):
 
 def start_emergency_flow(reply_token, group_id, user_id, already_pending_text):
     """119 文字指令與「🚨 緊急救護」按鈕共用的啟動流程。"""
-    if group_id in active_incidents:
+    if not is_rescue_service_time():
+        reply_text(reply_token, SERVICE_TIME_MESSAGE)
+    elif group_id in active_incidents:
         reply_text(reply_token, "⚠️ 目前已有進行中的救護事件，請先由最高管理者結束現有事件。")
     elif group_id in pending_locations:
         reply_text(reply_token, already_pending_text)
@@ -1016,7 +1049,8 @@ def start_emergency_flow(reply_token, group_id, user_id, already_pending_text):
 EMP_HELP_TEXT = (
     "【廠區救護通報機器人】\n"
     "申請：申請通報權限（需填工號、姓名、分機，並經管理員核准）\n"
-    "119：緊急通報（限已核准員工），再輸入事故地點即可發出\n"
+    "119：緊急通報（限已核准員工），輸入地點後確認才會通知群組（週一至週五 08:00～17:00）\n"
+    "測試通報：測試通報流程，不會通知群組或建立事件\n"
     "我的資料：查詢申請狀態\n"
     "取消：取消目前進行中的操作"
 )
@@ -1024,7 +1058,7 @@ EMP_HELP_TEXT = (
 EMP_STATUS_TEXT = {
     "draft": "尚未完成申請，請輸入「申請」重新填寫。",
     "pending": "申請已送出，正在等待管理員核准。",
-    "approved": "已核准，可使用「119」通報。",
+    "approved": "已核准，可使用「119」通報；輸入事故地點後，須按確認通報才會通知群組。",
     "rejected": "申請未獲核准，如有疑問請洽管理員；可輸入「申請」重新申請。",
     "disabled": "通報權限已被停用，請洽管理員；可輸入「申請」重新申請。",
 }
@@ -1245,7 +1279,7 @@ def start_application(token, user_id, emp):
     elif status == "pending":
         reply_text(token, "您的申請已送出，正在等待管理員核准。")
     elif employee_begin_application(user_id):
-        reply_text(token, "請輸入您的工號（英數字，例如 A12345）。\n輸入「取消」可中止申請。")
+        reply_text(token, "請輸入您的工號(英數字，例如6A160)。\n輸入『取消』可中止申請。")
     else:
         reply_text(token, "目前無法申請，請洽管理員。")
 
@@ -1287,10 +1321,10 @@ def handle_application_step(token, user_id, emp, step, cmd, text):
             reply_text(token, f"姓名請輸入 1～{MAX_NAME_LENGTH} 個字。")
         else:
             employee_update(user_id, name=name, step="ext", step_at=now_tw())
-            reply_text(token, "請輸入您的分機號碼（數字，可含 - 或 #）。")
+            reply_text(token, "請輸入您的分機號碼(數字，例如8119)。")
     elif step == "ext":
         if not EXT_PATTERN.match(cmd):
-            reply_text(token, "分機格式不正確，請輸入數字（可含 - 或 #），最長 10 字元。")
+            reply_text(token, "分機格式不正確，請輸入數字，例如 8119")
         else:
             employee_update(user_id, ext=cmd, step="confirm", step_at=now_tw())
             reply_text(token, "請確認申請資料：\n"
@@ -1305,11 +1339,42 @@ def handle_application_step(token, user_id, emp, step, cmd, text):
                               "資料正確請回覆「確認」送出申請，要中止請回覆「取消」。")
 
 
-def begin_report(token, user_id, emp):
+def _employee_report_notice(emp, location):
+    reporter = f"{emp['name']}（工號 {emp['emp_no']}／分機 {emp['ext']}）"
+    notice = ("🚨 緊急救護通知，請回報支援狀況。\n"
+              f"通報人：{safe_notice_text(reporter)}\n"
+              f"事故地點：{safe_notice_text(location)}")
+    return reporter, notice
+
+
+def employee_confirmation_message(item):
+    """員工實際/測試通報確認卡片。"""
+    title = "【測試】通報資料確認" if item["kind"] == "test" else "🚨【緊急救護通報確認】"
+    contents = {
+        "type": "bubble", "size": "kilo",
+        "body": {"type": "box", "layout": "vertical", "spacing": "md", "contents": [
+            {"type": "text", "text": title, "weight": "bold", "size": "lg", "wrap": True},
+            {"type": "text", "text": f"通報人：{item['name']}\n工號：{item['emp_no']}\n分機：{item['ext']}\n事故地點：{item['location']}", "wrap": True, "size": "sm"},
+            {"type": "text", "text": "請確認資料正確後再送出。" if item["kind"] == "actual" else "此為測試流程，不會通知群組或建立救護事件。", "wrap": True, "size": "xs", "color": "#666666"}
+        ]},
+        "footer": {"type": "box", "layout": "vertical", "spacing": "sm", "contents": [
+            {"type": "button", "style": "primary", "color": "#D93025", "action": {"type": "postback", "label": "確認通報", "data": f"action=employee_report_confirm&token={item['token']}"}},
+            {"type": "button", "style": "secondary", "action": {"type": "postback", "label": "重新輸入地點", "data": f"action=employee_report_reenter&token={item['token']}"}},
+            {"type": "button", "style": "link", "action": {"type": "postback", "label": "取消", "data": f"action=employee_report_cancel&token={item['token']}"}}
+        ]}
+    }
+    alt = "測試通報資料確認" if item["kind"] == "test" else "緊急救護通報資料確認"
+    return flex_message(alt, contents)
+
+
+def begin_report(token, user_id, emp, kind="actual"):
     status = emp["status"] if emp else None
     if status != "approved":
         reply_text(token, "您尚未通過通報權限核准。\n"
                           + (EMP_STATUS_TEXT.get(status, "") if status else "請先輸入「申請」。"))
+        return
+    if kind == "actual" and not is_rescue_service_time():
+        reply_text(token, SERVICE_TIME_MESSAGE)
         return
     group_id = get_rescue_group_id()
     if not group_id:
@@ -1319,31 +1384,98 @@ def begin_report(token, user_id, emp):
     elif group_id in pending_locations:
         reply_text(token, "⚠️ 群組內正在進行救護啟動流程，請至群組輸入事故地點。")
     else:
-        employee_update(user_id, step="await_location", step_at=now_tw())
-        reply_text(token, "🚨 請直接輸入事故地點，收到後將立即通知救護群組（5 分鐘內有效）。\n輸入「取消」可取消。")
+        employee_update(user_id, step="await_location" if kind == "actual" else "await_test_location", step_at=now_tw())
+        prompt = "🚨 請輸入事故地點，確認資料後才會通知救護群組（5 分鐘內有效）。\n輸入『取消』可取消。" if kind == "actual" else "🧪 請輸入測試事故地點（5 分鐘內有效）。\n輸入『取消』可取消。"
+        reply_text(token, prompt)
 
 
-def submit_report(token, user_id, emp, text):
-    employee_update(user_id, step=None, step_at=None)
-    if emp["status"] != "approved":
+def prepare_employee_confirmation(token, user_id, emp, text, kind):
+    if not emp or emp["status"] != "approved":
+        employee_update(user_id, step=None, step_at=None)
         reply_text(token, "您的通報權限已變更，無法通報。請洽管理員。")
         return
     group_id = get_rescue_group_id()
     if not group_id:
+        employee_update(user_id, step=None, step_at=None)
         reply_text(token, "⚠️ 尚未設定救護通報群組，請立即改用電話通知，並聯絡管理員設定。")
         return
     if group_id in active_incidents:
+        employee_update(user_id, step=None, step_at=None)
         reply_text(token, "⚠️ 目前已有進行中的救護事件，群組已收到通知，請至群組查看並回報。")
         return
     if group_id in pending_locations:
+        employee_update(user_id, step=None, step_at=None)
         reply_text(token, "⚠️ 群組內正在進行救護啟動流程，請至群組輸入事故地點。")
         return
+    if kind == "actual" and not is_rescue_service_time():
+        employee_update(user_id, step=None, step_at=None)
+        reply_text(token, SERVICE_TIME_MESSAGE)
+        return
+    item = {
+        "token": uuid.uuid4().hex, "user_id": user_id, "kind": kind,
+        "name": emp["name"], "emp_no": emp["emp_no"], "ext": emp["ext"],
+        "location": clip_location(text), "created_at": now_tw(),
+    }
+    pending_employee_confirmations[user_id] = item
+    employee_update(user_id, step="await_confirm" if kind == "actual" else "await_test_confirm", step_at=item["created_at"])
+    line_bot_api.reply_message(token, employee_confirmation_message(item))
 
-    location = clip_location(text)
-    reporter = f"{emp['name']}（工號 {emp['emp_no']}／分機 {emp['ext']}）"
+
+def submit_report(token, user_id, emp, text):
+    prepare_employee_confirmation(token, user_id, emp, text, "actual")
+
+
+def confirm_employee_report(event, user_id, action, token_value):
+    token = event.reply_token
+    item = pending_employee_confirmations.get(user_id)
+    if not item or not token_value or item.get("token") != token_value:
+        reply_text(token, "此確認卡片已失效，請重新輸入「119」或「測試通報」。")
+        return
+    if (now_tw() - item["created_at"]).total_seconds() >= WAIT_SECONDS:
+        pending_employee_confirmations.pop(user_id, None)
+        employee_update(user_id, step=None, step_at=None)
+        reply_text(token, "⌛ 通報確認已逾時，請重新輸入「119」或「測試通報」。")
+        return
+    if action == "employee_report_cancel":
+        pending_employee_confirmations.pop(user_id, None)
+        employee_update(user_id, step=None, step_at=None)
+        reply_text(token, "已取消本次通報，未建立事件及通知群組。")
+        return
+    if action == "employee_report_reenter":
+        pending_employee_confirmations.pop(user_id, None)
+        employee_update(user_id, step="await_location" if item["kind"] == "actual" else "await_test_location", step_at=now_tw())
+        reply_text(token, "請重新輸入事故地點（5 分鐘內有效）。")
+        return
+
+    emp = get_employee(user_id)
+    if not emp or emp["status"] != "approved":
+        pending_employee_confirmations.pop(user_id, None)
+        employee_update(user_id, step=None, step_at=None)
+        reply_text(token, "您的通報權限已變更，無法通報。請洽管理員。")
+        return
+    group_id = get_rescue_group_id()
+    if not group_id or group_id in active_incidents or group_id in pending_locations:
+        pending_employee_confirmations.pop(user_id, None)
+        employee_update(user_id, step=None, step_at=None)
+        reply_text(token, "⚠️ 通報條件已變更，未建立事件或通知群組；請確認通報群組及目前事件狀態後重新操作。")
+        return
+    if item["kind"] == "actual" and not is_rescue_service_time():
+        pending_employee_confirmations.pop(user_id, None)
+        employee_update(user_id, step=None, step_at=None)
+        reply_text(token, SERVICE_TIME_MESSAGE)
+        return
+
+    # 先移除待確認資料，避免同一張卡片重複點擊造成重複建案。
+    pending_employee_confirmations.pop(user_id, None)
+    employee_update(user_id, step=None, step_at=None)
+    reporter, notice = _employee_report_notice(emp, item["location"])
+    if item["kind"] == "test":
+        reply_text(token, "測試通報完成，未通知群組\n\n【群組通知內容預覽】\n@全員\n" + notice)
+        return
+
     incident_id = next_incident_id()
     incident = {
-        "id": incident_id, "location": location,
+        "id": incident_id, "location": item["location"],
         "initiator": user_id, "initiator_name": reporter,
         "created_at": now_tw(), "responses": {},
     }
@@ -1353,17 +1485,13 @@ def submit_report(token, user_id, emp, text):
         logger.error("私訊通報：救護事件寫入資料庫失敗：%s", error)
         reply_text(token, "⚠️ 救護事件資料保存失敗，未發送通知！請立即改用電話通知，或稍後重新輸入「119」。")
         return
-
     active_incidents[group_id] = incident
     schedule_incident_timer(group_id, incident)
-    notice = (f"🚨 緊急救護通知，請回報支援狀況。\n"
-              f"通報人：{safe_notice_text(reporter)}\n"
-              f"事故地點：{safe_notice_text(location)}")
     if push_emergency_notice(group_id, notice, incident_id):
-        reply_text(token, f"✅ 已通知救護群組。\n事件編號：{incident_id}\n事故地點：{location}")
+        reply_text(token, f"✅ 已通知救護群組。\n事件編號：{incident_id}\n事故地點：{item['location']}")
     else:
         reply_text(token, f"⚠️ 事件 {incident_id} 已建立，但群組通知發送失敗（可能是訊息額度已用完）。\n"
-                          "請立即改用電話或其他方式通知現場人員！")
+                          "請立即撥打緊急電話 8119 通知！")
 
 
 def handle_employee_dm(event, user_id, cmd, text):
@@ -1374,10 +1502,11 @@ def handle_employee_dm(event, user_id, cmd, text):
     emp = get_employee(user_id)
     expired_notice = ""
     if emp and emp["step"]:
-        limit = WAIT_SECONDS if emp["step"] == "await_location" else REGISTRATION_STEP_TIMEOUT_SECONDS
+        limit = WAIT_SECONDS if emp["step"] in ("await_location", "await_test_location", "await_confirm", "await_test_confirm") else REGISTRATION_STEP_TIMEOUT_SECONDS
         started = emp["step_at"]
         if started is None or (now_tw() - started.astimezone(TAIWAN_TZ)).total_seconds() > limit:
             employee_update(user_id, step=None, step_at=None)
+            pending_employee_confirmations.pop(user_id, None)
             emp = {**emp, "step": None}
             expired_notice = "⌛ 上一個操作已逾時取消。\n"
     step = emp["step"] if emp else None
@@ -1385,10 +1514,17 @@ def handle_employee_dm(event, user_id, cmd, text):
     if cmd == "取消":
         if step:
             employee_update(user_id, step=None, step_at=None)
+            pending_employee_confirmations.pop(user_id, None)
             reply_text(token, "已取消目前操作。")
             return True
     elif step == "await_location":
         submit_report(token, user_id, emp, text)
+        return True
+    elif step == "await_test_location":
+        prepare_employee_confirmation(token, user_id, emp, text, "test")
+        return True
+    elif step in ("await_confirm", "await_test_confirm"):
+        reply_text(token, "請使用上方確認卡片的按鈕完成操作；如需中止請輸入『取消』。")
         return True
     elif step in ("emp_no", "name", "ext", "confirm"):
         handle_application_step(token, user_id, emp, step, cmd, text)
@@ -1398,7 +1534,10 @@ def handle_employee_dm(event, user_id, cmd, text):
         start_application(token, user_id, emp)
         return True
     if cmd in ("119", "通報", "緊急通報"):
-        begin_report(token, user_id, emp)
+        begin_report(token, user_id, emp, "actual")
+        return True
+    if cmd == "測試通報":
+        begin_report(token, user_id, emp, "test")
         return True
     if cmd in ("我的資料", "查詢申請", "申請狀態"):
         if not emp:
@@ -1422,7 +1561,11 @@ def is_admin_dm_command(cmd):
 def handle_dm_postback(event, user_id):
     """私訊中的按鈕：管理者核准或拒絕員工申請。"""
     data = parse_qs(getattr(event.postback, "data", ""))
-    if data.get("action", [""])[0] != "emp_review":
+    action = data.get("action", [""])[0]
+    if action in ("employee_report_confirm", "employee_report_reenter", "employee_report_cancel"):
+        confirm_employee_report(event, user_id, action, data.get("token", [""])[0])
+        return
+    if action != "emp_review":
         return
     token = event.reply_token
     if not is_admin(user_id):
@@ -1444,7 +1587,7 @@ def handle_dm_postback(event, user_id):
         return
     reply_text(token, f"已{'核准' if approved else '拒絕'}：{row['name']}"
                       f"（工號 {row['emp_no']}／分機 {row['ext']}）")
-    message = ("✅ 您的救護通報申請已核准。\n緊急時請私訊本機器人輸入「119」，再輸入事故地點即可通報。"
+    message = ("✅ 您的救護通報申請已核准。\n緊急時請私訊本機器人輸入「119」，再輸入事故地點，確認資料後按「確認通報」才會通知群組。\n也可輸入「測試通報」熟悉操作流程（不會通知群組）。"
                if approved else "❌ 您的救護通報申請未獲核准，如有疑問請洽管理員。")
     try:
         line_bot_api.push_message(uid, TextSendMessage(text=message))
@@ -1779,6 +1922,11 @@ def handle_event(event):
 
     # 等待初始事故地點：第一筆文字直接建立事件
     if group_id in pending_locations:
+        if not is_rescue_service_time():
+            pending_locations.pop(group_id, None)
+            clear_pending("location", group_id)
+            reply_text(event.reply_token, SERVICE_TIME_MESSAGE)
+            return
         if expire_if_needed("location", group_id):
             reply_text(event.reply_token, "緊急救護啟動流程已逾時取消，請重新輸入 119。")
             return
