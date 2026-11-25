@@ -625,7 +625,7 @@ def response_message_contents(incident_id):
             "type": "box", "layout": "vertical",
             "backgroundColor": "#F3F4F6", "paddingAll": "12px",
             "contents": [
-                {"type": "text", "text": "卡片若被洗版，輸入「救護回報」即可重新叫出。",
+                {"type": "text", "text": "被洗版請輸入「救護回報」重新叫出",
                  "size": "xs", "color": "#6B7280", "wrap": True, "align": "center"}
             ]
         }
@@ -643,8 +643,8 @@ def response_message(incident_id):
 # LINE 群組真正的 @All 通知
 # ============================================================
 def reply_emergency_notice(reply_token, notice, incident_id, group_id):
-    """先發送真正 @All 文字通知，再獨立 Push Flex 回報卡片。
-    若 @All 文字或回報卡片最終都送不出去，私訊最高管理者告警。"""
+    """以同一次 Reply 發送真正 @All 文字通知及 Flex 回報卡片（不耗推播額度）。
+    Reply 失敗時才改用 Push 補送；若 @All 文字或回報卡片最終都送不出去，私訊最高管理者告警。"""
     def send(url, payload):
         request = urllib.request.Request(
             url,
@@ -659,6 +659,7 @@ def reply_emergency_notice(reply_token, notice, incident_id, group_id):
             response.read()
 
     # 第一則訊息：使用 Reply Token 發送真正的 LINE 全員提及。
+    # 第二則訊息：Flex 回報卡片放在同一次 Reply 中一併送出（Reply 不耗推播額度）。
     text_payload = {
         "replyToken": reply_token,
         "messages": [{
@@ -670,14 +671,20 @@ def reply_emergency_notice(reply_token, notice, incident_id, group_id):
                     "mentionee": {"type": "all"}
                 }
             }
+        }, {
+            "type": "flex",
+            "altText": "請回報是否可以前往支援",
+            "contents": response_message_contents(incident_id)
         }]
     }
 
     text_sent = False
+    card_sent = False
     try:
         send("https://api.line.me/v2/bot/message/reply", text_payload)
         text_sent = True
-        logger.info("真正 @All 文字通知已發送。")
+        card_sent = True
+        logger.info("真正 @All 文字通知及 Flex 回報卡片已透過 Reply 發送。")
     except Exception as error:
         body = error.read().decode("utf-8", errors="replace") if hasattr(error, "read") else str(error)
         logger.error("LINE @All Reply 發送失敗：%s；%s", getattr(error, "code", "未知"), body)
@@ -704,17 +711,17 @@ def reply_emergency_notice(reply_token, notice, incident_id, group_id):
             body = push_error.read().decode("utf-8", errors="replace") if hasattr(push_error, "read") else str(push_error)
             logger.error("Push @All 文字通知失敗：%s；%s", getattr(push_error, "code", "未知"), body)
 
-    # 第二則訊息：獨立發送 Flex 回報卡片，不與 @All 文字合併。
-    card_sent = False
-    try:
-        line_bot_api.push_message(
-            group_id,
-            response_message(incident_id)
-        )
-        card_sent = True
-        logger.info("緊急救護 Flex 回報卡片已獨立發送。")
-    except Exception as error:
-        logger.error("Flex 回報卡片 Push 發送失敗：%s", error)
+    # 備援：Reply 失敗時，才改用 Push 補送 Flex 回報卡片。
+    if not card_sent:
+        try:
+            line_bot_api.push_message(
+                group_id,
+                response_message(incident_id)
+            )
+            card_sent = True
+            logger.info("緊急救護 Flex 回報卡片已透過 Push 補送。")
+        except Exception as error:
+            logger.error("Flex 回報卡片 Push 發送失敗：%s", error)
 
     if not (text_sent and card_sent):
         problems = []
@@ -1064,14 +1071,17 @@ def handle_event(event):
             # 成功回報不另外回覆群組；無法前往僅保存狀態與歷程。
             # 可前往時才依原有規則通知群組。
             # 從無法前往改為可前往，也會再次通知最新狀態。
+            # 通知文字不變，改用按鈕事件的 Reply 發送（不耗推播額度）；Reply 失敗才改用 Push。
             if status == "available" and old_status != "available":
+                notice_message = TextSendMessage(text=f"【救護回應】\n{display_name}：可前往")
                 try:
-                    line_bot_api.push_message(
-                        group_id,
-                        TextSendMessage(text=f"【救護回應】\n{display_name}：可前往")
-                    )
-                except Exception as error:
-                    logger.error("可前往群組通知失敗：%s", error)
+                    line_bot_api.reply_message(event.reply_token, notice_message)
+                except Exception as reply_error:
+                    logger.warning("可前往群組通知 Reply 失敗，改用 Push：%s", reply_error)
+                    try:
+                        line_bot_api.push_message(group_id, notice_message)
+                    except Exception as error:
+                        logger.error("可前往群組通知失敗：%s", error)
             return
 
         if action == "start_emergency":
