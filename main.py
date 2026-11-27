@@ -4,10 +4,12 @@ import json
 import logging
 import re
 import threading
+import time
 import unicodedata
 import uuid
 import urllib.request
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 from urllib.parse import parse_qs
@@ -29,6 +31,7 @@ from linebot.models import (
     MessageEvent,
     PostbackEvent,
     JoinEvent,
+    LeaveEvent,
     FollowEvent,
     TextMessage,
     TextSendMessage,
@@ -63,9 +66,27 @@ MAX_LOCATION_LENGTH = 300
 # Webhook 去重：保留最近處理過的事件識別碼數量
 DEDUP_CACHE_SIZE = 1000
 
-# 員工私訊通報：救護通知要推播到的群組。
-# 優先使用環境變數 RESCUE_GROUP_ID；未設定時，使用管理者在群組輸入「設定通報群組」所存的值。
+# 【多群組版】舊版環境變數 RESCUE_GROUP_ID 只作為「首次遷移」的來源：
+# 資料庫尚無主要救護群組時，才會用它（或舊的 bot_config.rescue_group_id）建立主要救護群組。
+# 遷移完成後一律以資料庫 notify_groups 為準，環境變數不再覆蓋資料庫設定。
 RESCUE_GROUP_ID_ENV = os.environ.get("RESCUE_GROUP_ID", "").strip()
+
+# 多群組通報：群組角色與通知模式
+GROUP_ROLE_PRIMARY = "primary"
+GROUP_ROLE_SECONDARY = "secondary"
+GROUP_ROLE_UNASSIGNED = "unassigned"   # 已背景收錄、尚未指派角色，不接收任何救護通知
+GROUP_MODE_RESPOND = "notify_and_respond"
+GROUP_MODE_NOTIFY_ONLY = "notify_only"
+GROUP_MODE_NONE = "none"
+GROUP_ROLE_TEXT = {GROUP_ROLE_PRIMARY: "主要救護群組", GROUP_ROLE_SECONDARY: "次要通知群組",
+                   GROUP_ROLE_UNASSIGNED: "未設定群組"}
+GROUP_MODE_TEXT = {GROUP_MODE_RESPOND: "通報＋回應", GROUP_MODE_NOTIFY_ONLY: "只通報事件",
+                   GROUP_MODE_NONE: "不通知"}
+NOTIFY_GROUPS_LOCK_KEY = 74110502  # 群組設定變更用的交易層級諮詢鎖
+
+# 在主要救護群組內由成員輸入 119 啟動的事件，是否也同步通知次要通知群組。
+# （員工私訊 119 通報固定會通知；此開關只影響群組內啟動的事件。）
+NOTIFY_SECONDARY_ON_GROUP_START = True
 
 # 員工欄位格式限制
 EMP_NO_PATTERN = re.compile(r"^[A-Za-z0-9\-]{1,20}$")
@@ -171,9 +192,48 @@ def get_db_connection():
     return psycopg.connect(_database_url(), row_factory=dict_row, connect_timeout=10)
 
 
+def _seed_primary_group_from_legacy(cur):
+    """【多群組遷移】資料庫尚無主要救護群組時，把舊設定轉成主要救護群組（冪等）。
+    舊版實際生效的是「環境變數優先，其次 bot_config.rescue_group_id」，遷移沿用同一順序，
+    確保升級前後通報目標不變。已有主要救護群組後，環境變數不再覆蓋資料庫。"""
+    cur.execute("SELECT group_id FROM notify_groups WHERE role = 'primary'")
+    primary_row = cur.fetchone()
+    cur.execute("SELECT config_value FROM bot_config WHERE config_key = 'rescue_group_id'")
+    legacy_row = cur.fetchone()
+    legacy_db = legacy_row["config_value"] if legacy_row else None
+
+    if primary_row:
+        primary = primary_row["group_id"]
+        if RESCUE_GROUP_ID_ENV and RESCUE_GROUP_ID_ENV != primary:
+            logger.warning(
+                "環境變數 RESCUE_GROUP_ID（%s）與資料庫主要救護群組（%s）不一致；"
+                "多群組版本一律以資料庫為準，該環境變數已不再生效，建議自 Render 移除。",
+                RESCUE_GROUP_ID_ENV, primary)
+        return
+
+    if RESCUE_GROUP_ID_ENV and legacy_db and RESCUE_GROUP_ID_ENV != legacy_db:
+        logger.warning(
+            "舊設定不一致：環境變數 RESCUE_GROUP_ID（%s）與 bot_config.rescue_group_id（%s）；"
+            "沿用舊版實際生效的環境變數值作為主要救護群組。",
+            RESCUE_GROUP_ID_ENV, legacy_db)
+    seed = RESCUE_GROUP_ID_ENV or legacy_db
+    if not seed:
+        logger.info("尚無舊版救護通報群組設定，主要救護群組待最高管理者設定。")
+        return
+    cur.execute(
+        "INSERT INTO notify_groups (group_id, role, notify_mode) "
+        "VALUES (%s, 'primary', 'notify_and_respond') "
+        "ON CONFLICT (group_id) DO UPDATE SET role='primary', "
+        "notify_mode='notify_and_respond', updated_at=NOW()",
+        (seed,),
+    )
+    logger.info("已將舊版救護通報群組轉換為主要救護群組：%s", seed)
+
+
 def init_database():
     """建立所需資料表；資料庫無法使用時直接讓服務啟動失敗。
-    資料表結構與原版完全相同；只是已完成的遷移不再於每次啟動重複執行。"""
+    資料表結構與原版完全相同；只是已完成的遷移不再於每次啟動重複執行。
+    多群組版僅「新增」notify_groups 資料表與 incidents 兩個欄位，不刪除、不改既有資料。"""
     statements = [
         """CREATE TABLE IF NOT EXISTS app_settings (
             setting_key TEXT PRIMARY KEY,
@@ -258,6 +318,29 @@ def init_database():
             config_value TEXT NOT NULL,
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )""",
+        # ---- 多群組通報（新增）----
+        # 角色與通知模式綁定：次要群組在資料庫層級就不可能取得「回應」權限。
+        # 三種角色：primary（通報＋回應）、secondary（只通報）、unassigned（已收錄但不通知，notify_mode='none'）。
+        """CREATE TABLE IF NOT EXISTS notify_groups (
+            group_id TEXT PRIMARY KEY,
+            role TEXT NOT NULL DEFAULT 'unassigned'
+                CHECK (role IN ('primary', 'secondary', 'unassigned')),
+            notify_mode TEXT NOT NULL DEFAULT 'none'
+                CHECK (notify_mode IN ('notify_and_respond', 'notify_only', 'none')),
+            group_name TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            CONSTRAINT notify_groups_role_mode_match CHECK (
+                (role = 'primary' AND notify_mode = 'notify_and_respond')
+                OR (role = 'secondary' AND notify_mode = 'notify_only')
+                OR (role = 'unassigned' AND notify_mode = 'none'))
+        )""",
+        # 同一時間只能有一個主要救護群組。
+        """CREATE UNIQUE INDEX IF NOT EXISTS one_primary_group
+            ON notify_groups(role) WHERE role = 'primary'""",
+        # 「首次可前往」出動通知的一次性紀錄（資料庫層級原子化，Render 重啟不會重複通知）。
+        """ALTER TABLE incidents ADD COLUMN IF NOT EXISTS dispatch_notified_at TIMESTAMPTZ""",
+        """ALTER TABLE incidents ADD COLUMN IF NOT EXISTS dispatch_notified_by TEXT""",
     ]
     with get_db_connection() as conn:
         with conn.cursor() as cur:
@@ -286,6 +369,36 @@ def init_database():
                 "SELECT 1 FROM incident_response_history h "
                 "WHERE h.incident_id=r.incident_id AND h.user_id=r.user_id)"
             )
+
+            # 【私訊管理版】舊版 notify_groups 只允許 primary / secondary；這裡冪等地放寬為三種角色。
+            # 只有在現有限制尚未包含 'unassigned' 時才調整，已調整過就不再動（避免每次啟動鎖表）。
+            cur.execute(
+                "SELECT pg_get_constraintdef(oid) AS definition FROM pg_constraint "
+                "WHERE conname = 'notify_groups_role_mode_match' "
+                "AND conrelid = 'notify_groups'::regclass"
+            )
+            row = cur.fetchone()
+            if row and "unassigned" not in row["definition"]:
+                cur.execute("ALTER TABLE notify_groups DROP CONSTRAINT IF EXISTS notify_groups_role_mode_match")
+                cur.execute("ALTER TABLE notify_groups DROP CONSTRAINT IF EXISTS notify_groups_role_check")
+                cur.execute("ALTER TABLE notify_groups DROP CONSTRAINT IF EXISTS notify_groups_notify_mode_check")
+                cur.execute(
+                    "ALTER TABLE notify_groups ADD CONSTRAINT notify_groups_role_check "
+                    "CHECK (role IN ('primary', 'secondary', 'unassigned'))")
+                cur.execute(
+                    "ALTER TABLE notify_groups ADD CONSTRAINT notify_groups_notify_mode_check "
+                    "CHECK (notify_mode IN ('notify_and_respond', 'notify_only', 'none'))")
+                cur.execute(
+                    "ALTER TABLE notify_groups ADD CONSTRAINT notify_groups_role_mode_match CHECK ("
+                    "(role = 'primary' AND notify_mode = 'notify_and_respond') "
+                    "OR (role = 'secondary' AND notify_mode = 'notify_only') "
+                    "OR (role = 'unassigned' AND notify_mode = 'none'))")
+                cur.execute("ALTER TABLE notify_groups ALTER COLUMN role SET DEFAULT 'unassigned'")
+                cur.execute("ALTER TABLE notify_groups ALTER COLUMN notify_mode SET DEFAULT 'none'")
+                logger.info("notify_groups 已遷移為支援 unassigned 角色。")
+
+            # 多群組：舊的單一救護群組設定 → 主要救護群組（冪等）。
+            _seed_primary_group_from_legacy(cur)
 
 
 def create_incident_record(incident, group_id):
@@ -538,20 +651,6 @@ def flex_message(alt_text, contents):
 def postback(label, data, display_text=None):
     return {"type": "postback", "label": label, "data": data,
             "displayText": display_text or label}
-
-
-def panel_message():
-    contents = {
-        "type": "bubble",
-        "size": "kilo",
-        "body": {"type": "box", "layout": "vertical", "spacing": "md", "contents": [
-            {"type": "text", "text": "廠區緊急救護面板", "weight": "bold", "size": "lg"},
-            {"type": "text", "text": "發生緊急狀況時，請在群組輸入 119 啟動救護流程。", "wrap": True, "size": "sm"},
-            {"type": "button", "style": "primary", "color": "#D93025", "height": "md",
-             "action": postback("🚨 緊急救護", "action=start_emergency")}
-        ]}
-    }
-    return flex_message("廠區緊急救護面板", contents)
 
 
 def pending_location_message(token):
@@ -968,8 +1067,11 @@ def build_admin_menu():
         "待核准名單：顯示待核准的員工申請（附核准／拒絕按鈕）\n"
         "員工名單：查詢員工申請與核准名單\n"
         "停用員工 工號：停用已核准員工的通報權限\n"
-        "通報群組：查詢目前的救護通報群組\n"
-        "（在要接收通報的群組輸入「設定通報群組」即可設定）"
+        "通報群組：以按鈕卡片集中管理所有群組（設為主要／次要、取消設定、移除清單）\n"
+        "\n【群組設定說明】\n"
+        "所有群組設定皆透過私訊輸入「通報群組」，以按鈕卡片集中管理；群組內無任何設定指令。\n"
+        "機器人被加入新群組時，會在群組內保持靜音，並私訊您一張設定卡片。\n"
+        "主要救護群組全系統只有 1 個；進行中救護事件期間不可轉移。"
     )
 
 
@@ -1020,8 +1122,23 @@ def reply_text(reply_token, text):
     )
 
 
-def start_emergency_flow(reply_token, group_id, user_id, already_pending_text):
-    """119 文字指令與「🚨 緊急救護」按鈕共用的啟動流程。"""
+def start_emergency_flow(reply_token, group_id, user_id, already_pending_text, reply_when_blocked=True):
+    """119 文字指令與舊版「🚨 緊急救護」按鈕共用的啟動流程。
+    只有主要救護群組可以啟動；次要通知群組與未設定群組一律不可啟動。
+    reply_when_blocked=True 時（119 文字指令），被擋下會回覆一句簡短提示，避免緊急時毫無反應；
+    舊面板按鈕則靜默忽略。"""
+    if not has_group_context(group_id):
+        try:
+            group_row = get_notify_group(group_id)
+        except Exception:
+            logger.exception("查詢群組角色失敗，無法確認是否為主要救護群組")
+            if reply_when_blocked:
+                reply_text(reply_token, "⚠️ 系統暫時無法確認群組設定，請改撥緊急電話 8119。")
+            return
+        if not group_row or group_row["role"] != GROUP_ROLE_PRIMARY:
+            if reply_when_blocked:
+                reply_text(reply_token, NOT_PRIMARY_119_TEXT)
+            return
     if not is_rescue_service_time():
         reply_text(reply_token, SERVICE_TIME_MESSAGE)
     elif group_id in active_incidents:
@@ -1080,9 +1197,504 @@ def set_config(key, value):
         )
 
 
+# ---------------- 多群組通報：群組設定（全部由最高管理者私訊 Flex 卡片操作）----------------
+# 群組內沒有任何設定指令；機器人在群組內不主動發言（入群、補錄、角色變更皆靜音）。
+NOT_PRIMARY_119_TEXT = ("ℹ️ 本群組並非救護通報群組，無法啟動救護流程。\n"
+                        "如遇緊急狀況，請撥打緊急電話 8119，或私訊機器人通報。")
+GROUP_BUSY_TEXT = "⛔ 目前有進行中的救護事件或等待地點流程，禁止轉移主要救護群組。"
+GROUP_NAME_FALLBACK = "無法取得群組名稱"
+GROUP_NAME_REFRESH_SECONDS = 24 * 60 * 60   # 同一群組的名稱最多每 24 小時向 LINE 查一次
+GROUPS_PER_CAROUSEL = 10                    # LINE：單一 Carousel 最多 10 個 Bubble
+GROUPS_PER_PAGE = 40                        # 單次 Reply 最多 5 則：1 則摘要文字 + 4 個 Carousel
+
+# 背景補錄用的記憶體快取：group_id -> 上次處理（確認收錄＋刷新名稱）的時間。
+# 命中快取時完全不查資料庫、不呼叫 LINE API，避免拖慢群組內的 119 流程。
+_known_groups = {}
+_known_groups_lock = threading.Lock()
+_group_backfill_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="group-backfill")
+
+
 def get_rescue_group_id():
-    """通報群組：環境變數優先，其次為管理者在群組設定的值。"""
-    return RESCUE_GROUP_ID_ENV or get_config("rescue_group_id")
+    """主要救護群組：一律讀資料庫 notify_groups（舊環境變數與 bot_config 只在啟動時遷移一次）。"""
+    with get_db_connection() as conn:
+        row = conn.execute("SELECT group_id FROM notify_groups WHERE role='primary'").fetchone()
+    return row["group_id"] if row else None
+
+
+def get_notify_group(group_id):
+    with get_db_connection() as conn:
+        return conn.execute(
+            "SELECT group_id, role, notify_mode, group_name, updated_at FROM notify_groups WHERE group_id=%s",
+            (group_id,),
+        ).fetchone()
+
+
+def list_notify_groups():
+    """所有已收錄群組：primary → secondary → unassigned；同角色依 updated_at 由新到舊。"""
+    with get_db_connection() as conn:
+        return conn.execute(
+            "SELECT group_id, role, notify_mode, group_name, updated_at FROM notify_groups "
+            "ORDER BY CASE role WHEN 'primary' THEN 0 WHEN 'secondary' THEN 1 ELSE 2 END, "
+            "updated_at DESC, group_id"
+        ).fetchall()
+
+
+def has_group_context(group_id):
+    """該群組目前是否有進行中的救護事件或等待流程（只看記憶體）。
+    只有主要救護群組才可能有這些狀態，所以有就等同「該群組有救護操作權」。"""
+    return (group_id in active_incidents or group_id in pending_locations
+            or group_id in pending_corrections)
+
+
+def is_primary_group(group_id):
+    """是否為主要救護群組。群組有進行中狀態時直接放行（不查資料庫），避免資料庫抖動擋到救護流程；
+    其餘才查資料庫，查詢失敗視為否（只影響非進行中的操作）。"""
+    if not group_id:
+        return False
+    if has_group_context(group_id):
+        return True
+    try:
+        row = get_notify_group(group_id)
+    except Exception:
+        logger.exception("查詢群組角色失敗，視為非主要救護群組")
+        return False
+    return bool(row) and row["role"] == GROUP_ROLE_PRIMARY
+
+
+def get_group_name(group_id):
+    try:
+        return line_bot_api.get_group_summary(group_id).group_name
+    except Exception:
+        return None
+
+
+def record_group(group_id, group_name):
+    """收錄群組（不覆蓋既有角色）。回傳 'new'（新增，角色 unassigned）或 'exists'（已存在）。
+    已存在時只在取得新名稱時更新 group_name，不更動 role 與 updated_at。"""
+    with get_db_connection() as conn:
+        with conn.transaction():
+            row = conn.execute(
+                "INSERT INTO notify_groups (group_id, role, notify_mode, group_name) "
+                "VALUES (%s, 'unassigned', 'none', %s) ON CONFLICT (group_id) DO NOTHING "
+                "RETURNING group_id",
+                (group_id, group_name or GROUP_NAME_FALLBACK),
+            ).fetchone()
+            if row:
+                return "new"
+            if group_name:
+                conn.execute(
+                    "UPDATE notify_groups SET group_name=%s WHERE group_id=%s "
+                    "AND group_name IS DISTINCT FROM %s",
+                    (group_name, group_id, group_name),
+                )
+            return "exists"
+
+
+def forget_known_group(group_id):
+    with _known_groups_lock:
+        _known_groups.pop(group_id, None)
+
+
+def _backfill_group(group_id):
+    """背景補錄（在背景執行緒執行）：群組內完全不回應、不產生任何訊息，也不私訊管理者。"""
+    try:
+        record_group(group_id, get_group_name(group_id))
+    except Exception:
+        logger.exception("群組背景補錄失敗：%s", group_id)
+        forget_known_group(group_id)   # 下一則群組訊息再試一次
+
+
+def schedule_group_backfill(group_id):
+    """每個群組在快取有效期內只會排程一次（程式重啟後第一則訊息會重新確認一次）。"""
+    now = time.monotonic()
+    with _known_groups_lock:
+        last = _known_groups.get(group_id)
+        if last is not None and now - last < GROUP_NAME_REFRESH_SECONDS:
+            return
+        _known_groups[group_id] = now
+    try:
+        _group_backfill_executor.submit(_backfill_group, group_id)
+    except RuntimeError:  # 程式關閉中
+        forget_known_group(group_id)
+
+
+def set_primary_group(group_id):
+    """設定／轉移主要救護群組（單一交易，目標群組必須已收錄）。
+    回傳 dict：result = 'missing'（目標不在清單）/ 'already'（已是主要）/ 'busy'（資料庫有進行中事件）/
+    'set'（原本沒有主要群組）/ 'moved'（轉移成功，原主要群組自動降為次要）；
+    並附 target（目標資料列）與 old（原主要群組資料列，可能為 None）。"""
+    with get_db_connection() as conn:
+        with conn.transaction():
+            conn.execute("SELECT pg_advisory_xact_lock(%s)", (NOTIFY_GROUPS_LOCK_KEY,))
+            target = conn.execute(
+                "SELECT group_id, role, group_name FROM notify_groups WHERE group_id=%s FOR UPDATE",
+                (group_id,),
+            ).fetchone()
+            if not target:
+                return {"result": "missing", "target": None, "old": None}
+            old = conn.execute(
+                "SELECT group_id, group_name FROM notify_groups WHERE role='primary' FOR UPDATE"
+            ).fetchone()
+            if old and old["group_id"] == group_id:
+                return {"result": "already", "target": target, "old": old}
+            if conn.execute("SELECT 1 AS hit FROM incidents WHERE status='active' LIMIT 1").fetchone():
+                return {"result": "busy", "target": target, "old": old}
+            if old:
+                # 原主要群組自動降為次要通知群組，不遺失其設定。
+                conn.execute(
+                    "UPDATE notify_groups SET role='secondary', notify_mode='notify_only', "
+                    "updated_at=NOW() WHERE group_id=%s",
+                    (old["group_id"],),
+                )
+            conn.execute(
+                "UPDATE notify_groups SET role='primary', notify_mode='notify_and_respond', "
+                "updated_at=NOW() WHERE group_id=%s",
+                (group_id,),
+            )
+            # 同步舊設定鍵，方便必要時退回舊版程式。
+            conn.execute(
+                "INSERT INTO bot_config (config_key, config_value) VALUES ('rescue_group_id', %s) "
+                "ON CONFLICT (config_key) DO UPDATE SET config_value=EXCLUDED.config_value, updated_at=NOW()",
+                (group_id,),
+            )
+            return {"result": "moved" if old else "set", "target": target, "old": old}
+
+
+def change_group_role(group_id, op):
+    """set_secondary / unset / delete。回傳 (結果, 目標資料列)：
+    'missing'（不在清單）、'primary'（主要群組不可操作）、'same'（角色已是目標狀態）、
+    'not_unassigned'（delete 僅限未設定群組）、'done'。
+    unset 只把角色改回 unassigned，保留在清單與所有歷史事件紀錄；delete 只刪設定列。"""
+    with get_db_connection() as conn:
+        with conn.transaction():
+            conn.execute("SELECT pg_advisory_xact_lock(%s)", (NOTIFY_GROUPS_LOCK_KEY,))
+            row = conn.execute(
+                "SELECT group_id, role, group_name FROM notify_groups WHERE group_id=%s FOR UPDATE",
+                (group_id,),
+            ).fetchone()
+            if not row:
+                return "missing", None
+            role = row["role"]
+            if op == "set_secondary":
+                if role == GROUP_ROLE_PRIMARY:
+                    return "primary", row
+                if role == GROUP_ROLE_SECONDARY:
+                    return "same", row
+                conn.execute(
+                    "UPDATE notify_groups SET role='secondary', notify_mode='notify_only', "
+                    "updated_at=NOW() WHERE group_id=%s", (group_id,))
+            elif op == "unset":
+                if role == GROUP_ROLE_PRIMARY:
+                    return "primary", row
+                if role == GROUP_ROLE_UNASSIGNED:
+                    return "same", row
+                conn.execute(
+                    "UPDATE notify_groups SET role='unassigned', notify_mode='none', "
+                    "updated_at=NOW() WHERE group_id=%s", (group_id,))
+            elif op == "delete":
+                if role != GROUP_ROLE_UNASSIGNED:
+                    return "not_unassigned", row
+                conn.execute("DELETE FROM notify_groups WHERE group_id=%s", (group_id,))
+            else:
+                raise ValueError("未知的群組操作")
+            return "done", row
+
+
+# ---------------- 群組設定 Flex 卡片 ----------------
+GROUP_CARD_STYLE = {
+    GROUP_ROLE_PRIMARY: ("🟢 主要救護群組", "#16834A"),
+    GROUP_ROLE_SECONDARY: ("🔵 次要通知群組", "#1A73E8"),
+    GROUP_ROLE_UNASSIGNED: ("⚪ 未設定群組", "#6B7280"),
+}
+
+
+def _group_cfg_data(op, group_id):
+    return f"action=group_cfg&op={op}&gid={group_id}"
+
+
+def group_card_bubble(row, note=None):
+    """單一群組的設定卡片（Bubble）。按鈕依目前角色動態顯示。"""
+    role = row["role"]
+    group_id = row["group_id"]
+    label, color = GROUP_CARD_STYLE.get(role, GROUP_CARD_STYLE[GROUP_ROLE_UNASSIGNED])
+    name = row.get("group_name") or GROUP_NAME_FALLBACK
+
+    body = []
+    if note:
+        body.append({"type": "text", "text": note, "size": "xs", "color": "#B45309", "wrap": True})
+    body.extend([
+        {"type": "text", "text": label, "weight": "bold", "size": "sm", "color": color, "wrap": True},
+        {"type": "text", "text": name, "weight": "bold", "size": "lg", "wrap": True, "maxLines": 3},
+        {"type": "text", "text": f"群組 ID：{group_id}", "size": "xxs", "color": "#9CA3AF", "wrap": True},
+    ])
+
+    if role == GROUP_ROLE_PRIMARY:
+        footer = [{"type": "text", "text": "目前為主要群組（不可直接取消，請由其他群組卡片轉移）",
+                   "size": "xs", "color": "#6B7280", "wrap": True}]
+    elif role == GROUP_ROLE_SECONDARY:
+        footer = [
+            {"type": "button", "style": "primary", "color": "#16834A", "height": "sm",
+             "action": postback("轉為主要群組", _group_cfg_data("set_primary", group_id))},
+            {"type": "button", "style": "secondary", "height": "sm",
+             "action": postback("取消通報設定", _group_cfg_data("unset", group_id))},
+        ]
+    else:
+        footer = [
+            {"type": "button", "style": "primary", "color": "#16834A", "height": "sm",
+             "action": postback("設為主要群組", _group_cfg_data("set_primary", group_id))},
+            {"type": "button", "style": "primary", "color": "#1A73E8", "height": "sm",
+             "action": postback("設為次要群組", _group_cfg_data("set_secondary", group_id))},
+            {"type": "button", "style": "secondary", "height": "sm",
+             "action": postback("移除清單", _group_cfg_data("delete", group_id))},
+        ]
+    return {
+        "type": "bubble", "size": "kilo",
+        "body": {"type": "box", "layout": "vertical", "spacing": "sm", "contents": body},
+        "footer": {"type": "box", "layout": "vertical", "spacing": "sm", "contents": footer},
+    }
+
+
+def new_group_card_message(row):
+    """新群組加入時私訊最高管理者的設定卡片（單一 Bubble）。"""
+    bubble = group_card_bubble(row, note="🆕 機器人剛被加入新群組，請指派角色")
+    return flex_message("新群組加入：" + (row.get("group_name") or GROUP_NAME_FALLBACK), bubble)
+
+
+def build_group_list_messages(rows, page=1):
+    """「通報群組」回覆：1 則摘要文字 + 最多 4 個 Carousel（每個最多 10 張卡片），共 ≤ 5 則。
+    每頁 40 個群組；超過時以「通報群組 2」翻頁。"""
+    if not rows:
+        return [TextSendMessage(text="目前尚未收錄任何群組。請先將機器人邀請進群組，"
+                                     "或請既有群組成員在群組內發送任一則訊息後再查詢。")]
+    total_pages = (len(rows) + GROUPS_PER_PAGE - 1) // GROUPS_PER_PAGE
+    if page < 1 or page > total_pages:
+        return [TextSendMessage(text=f"沒有第 {page} 頁；目前共 {total_pages} 頁。")]
+    start = (page - 1) * GROUPS_PER_PAGE
+    chunk = rows[start:start + GROUPS_PER_PAGE]
+
+    primary_count = sum(1 for r in rows if r["role"] == GROUP_ROLE_PRIMARY)
+    secondary_count = sum(1 for r in rows if r["role"] == GROUP_ROLE_SECONDARY)
+    unassigned_count = len(rows) - primary_count - secondary_count
+    lines = ["【通報群組設定】",
+             f"共 {len(rows)} 個群組：主要 {primary_count}｜次要 {secondary_count}｜未設定 {unassigned_count}"]
+    if primary_count == 0:
+        lines.append("⚠️ 尚未設定主要救護群組，員工 119 私訊通報將無法通知群組。")
+    if total_pages > 1:
+        lines.append(f"目前顯示第 {page}/{total_pages} 頁（第 {start + 1}～{start + len(chunk)} 個）。"
+                     + (f"輸入「通報群組 {page + 1}」看下一頁。" if page < total_pages else ""))
+    messages = [TextSendMessage(text="\n".join(lines))]
+    for offset in range(0, len(chunk), GROUPS_PER_CAROUSEL):
+        part = chunk[offset:offset + GROUPS_PER_CAROUSEL]
+        carousel = {"type": "carousel", "contents": [group_card_bubble(r) for r in part]}
+        messages.append(flex_message(f"通報群組設定（{start + offset + 1}～{start + offset + len(part)}）", carousel))
+    return messages
+
+
+def reply_group_list(token, page=1):
+    line_bot_api.reply_message(token, build_group_list_messages(list_notify_groups(), page))
+
+
+def _group_label(row):
+    return f"「{(row or {}).get('group_name') or GROUP_NAME_FALLBACK}」（{(row or {}).get('group_id', '')}）"
+
+
+def handle_group_cfg_postback(event, user_id, data):
+    """私訊卡片按鈕：群組設定。所有操作先驗證最高管理者，結果只回覆管理者私訊，不對任何群組發送訊息。"""
+    token = event.reply_token
+    if not is_admin(user_id):
+        reply_text(token, "⛔ 僅最高管理者可以設定通報群組。")
+        return
+    op = data.get("op", [""])[0]
+    group_id = data.get("gid", [""])[0]
+    if op not in ("set_primary", "set_secondary", "unset", "delete") or not group_id:
+        reply_text(token, "按鈕資料不正確。")
+        return
+    try:
+        if op == "set_primary":
+            target = get_notify_group(group_id)
+            if not target:
+                reply_text(token, "找不到這個群組（可能已從清單移除），請重新輸入「通報群組」。")
+                return
+            if target["role"] == GROUP_ROLE_PRIMARY:
+                reply_text(token, f"{_group_label(target)}已經是主要救護群組。")
+                return
+            # 進行中事件防呆：記憶體（active_incidents / pending_locations / pending_corrections）
+            # 與資料庫（交易內再檢查一次 active 事件）都要通過。
+            if active_incidents or pending_locations or pending_corrections:
+                reply_text(token, GROUP_BUSY_TEXT)
+                return
+            outcome = set_primary_group(group_id)
+            result = outcome["result"]
+            if result == "busy":
+                reply_text(token, GROUP_BUSY_TEXT)
+            elif result == "missing":
+                reply_text(token, "找不到這個群組（可能已從清單移除），請重新輸入「通報群組」。")
+            elif result == "already":
+                reply_text(token, f"{_group_label(outcome['target'])}已經是主要救護群組。")
+            else:
+                text = f"✅ 已將 {_group_label(outcome['target'])}設為主要救護群組（通報＋回應）。"
+                if result == "moved":
+                    logger.info("主要救護群組已轉移：%s → %s", outcome["old"]["group_id"], group_id)
+                    text += f"\n原主要救護群組 {_group_label(outcome['old'])}已自動改為次要通知群組。"
+                text += "\n該群組內不會發送任何訊息；現場人員在群組輸入 119 即可啟動救護流程。"
+                reply_text(token, text)
+            return
+
+        result, row = change_group_role(group_id, op)
+        if result == "missing":
+            reply_text(token, "找不到這個群組（可能已從清單移除），請重新輸入「通報群組」。")
+        elif result == "primary":
+            if op == "set_secondary":
+                reply_text(token, f"⛔ {_group_label(row)}目前是主要救護群組。\n"
+                                  "請先從其他群組卡片將另一個群組轉為主要群組，原主要群組會自動改為次要。")
+            else:
+                reply_text(token, f"⛔ {_group_label(row)}是主要救護群組，不能直接取消。\n"
+                                  "請從其他群組卡片轉移主要群組後，再回來操作。")
+        elif result == "not_unassigned":
+            reply_text(token, f"⛔ {_group_label(row)}目前是{GROUP_ROLE_TEXT.get(row['role'], row['role'])}，"
+                              "請先取消通報設定（或轉移主要群組）後才能移除。")
+        elif result == "same":
+            state = "次要通知群組" if op == "set_secondary" else "未設定群組"
+            reply_text(token, f"{_group_label(row)}已經是{state}，無需重複操作。")
+        elif op == "set_secondary":
+            note = "" if get_rescue_group_id() else "\n⚠️ 目前尚未設定主要救護群組。"
+            reply_text(token, f"✅ 已將 {_group_label(row)}加入次要通知群組（只接收通報與出動通知）。" + note)
+        elif op == "unset":
+            reply_text(token, f"✅ 已取消 {_group_label(row)}的通報設定，後續新事件不會再通知該群組。\n"
+                              "群組仍保留在清單中，歷史事件與回應紀錄不受影響。")
+        else:  # delete
+            forget_known_group(group_id)
+            left = True
+            try:
+                line_bot_api.leave_group(group_id)   # 退出群組是靜默動作，不會在群組內發送訊息
+            except Exception as error:
+                left = False
+                logger.warning("移除群組後退出群組失敗：%s；%s", group_id, error)
+            text = f"✅ 已將 {_group_label(row)}從清單移除，歷史事件紀錄不受影響。\n"
+            text += ("機器人已退出該群組。" if left else
+                     "⚠️ 機器人退出該群組失敗（可能已不在群組內）；若仍在群組內，該群組有人發言時會被重新收錄。")
+            reply_text(token, text)
+    except Exception:
+        logger.exception("群組設定操作失敗：%s %s", op, group_id)
+        reply_text(token, "⚠️ 群組設定失敗，資料庫狀態未變更，請稍後再試。")
+
+
+# ---------------- 多群組通報：次要群組通知 ----------------
+def secondary_group_ids_for(incident_group_id):
+    """事件所屬群組是主要救護群組時，回傳所有次要通知群組 ID；否則回傳空清單。"""
+    primary = get_rescue_group_id()
+    if not primary or primary != incident_group_id:
+        return []
+    # 只撈 role='secondary'：未設定群組（unassigned）不會收到任何救護通知。
+    with get_db_connection() as conn:
+        rows = conn.execute(
+            "SELECT group_id FROM notify_groups WHERE role='secondary' ORDER BY created_at, group_id"
+        ).fetchall()
+    return [r["group_id"] for r in rows]
+
+
+def build_secondary_initial_text(incident):
+    return (
+        "🚨【緊急救護通報】\n"
+        f"事件編號：{incident['id']}\n"
+        f"通報人：{incident.get('initiator_name', '未知')}\n"
+        f"事故地點：{incident['location']}\n"
+        f"通報時間：{time_text(incident['created_at'])}\n"
+        "（本群組為次要通知群組，僅供知悉；救護回應由主要救護群組處理。）"
+    )
+
+
+def build_dispatch_notice_text(incident, responded_at):
+    return (
+        "【緊急救護人員出動通知】\n\n"
+        "原通報事件已有救護人員回應，已出動前往現場。\n\n"
+        f"事件編號：{incident['id']}\n"
+        f"事故地點：{incident['location']}\n"
+        "救護狀態：已有人員前往處理\n"
+        f"回應時間：{time_text(responded_at)}"
+    )
+
+
+def _push_text_to_groups(group_ids, text, what, incident_id):
+    """逐群組各自發送；任一失敗不影響其他群組。回傳失敗的群組 ID 清單。"""
+    failed = []
+    for target in group_ids:
+        try:
+            line_bot_api.push_message(target, TextSendMessage(text=text))
+        except Exception as error:
+            failed.append(target)
+            logger.error("%s發送失敗：事件 %s；群組 %s；%s", what, incident_id, target, error)
+    return failed
+
+
+def broadcast_initial_notice_to_secondary(incident, incident_group_id):
+    """119 通報成立後，同步通知所有次要通知群組（純文字、無回應按鈕）。
+    本函式不會拋出例外，也不影響主要救護群組的通知。"""
+    try:
+        targets = secondary_group_ids_for(incident_group_id)
+        if not targets:
+            return
+        failed = _push_text_to_groups(targets, build_secondary_initial_text(incident),
+                                      "次要群組初始通報", incident["id"])
+        if failed:
+            alert_admin("⚠️【次要通知群組通報失敗】\n"
+                        f"事件編號：{incident['id']}\n"
+                        f"失敗群組 ID：{'、'.join(failed)}\n"
+                        "主要救護群組及事件不受影響。常見原因：機器人已被移出群組或當月訊息額度用完。")
+    except Exception:
+        logger.exception("次要群組初始通報處理失敗（不影響主要救護群組）：%s", incident.get("id"))
+
+
+def claim_dispatch_notification(incident_id, responder_id):
+    """資料庫層級的一次性認領：只有第一個把 dispatch_notified_at 由 NULL 改成時間的人會成功。
+    Render 重啟、多執行緒或 Webhook 重送都不會造成重複通知。"""
+    with get_db_connection() as conn:
+        row = conn.execute(
+            "UPDATE incidents SET dispatch_notified_at=NOW(), dispatch_notified_by=%s "
+            "WHERE incident_id=%s AND status='active' AND dispatch_notified_at IS NULL "
+            "RETURNING incident_id",
+            (responder_id, incident_id),
+        ).fetchone()
+    return row is not None
+
+
+def notify_dispatch_once(incident, incident_group_id, responder_id, responded_at):
+    """首次有人回報「可前往」時，通知原始通報員工及所有次要通知群組（同一事件只會通知一次）。
+    本函式不會拋出例外，也不影響原本的救護回應流程。"""
+    try:
+        try:
+            claimed = claim_dispatch_notification(incident["id"], responder_id)
+        except Exception:
+            # 認領失敗＝尚未通知；下一次「可前往」仍可再嘗試，不會漏通知也不會重複。
+            logger.exception("出動通知認領失敗：%s", incident["id"])
+            return
+        if not claimed:
+            return
+        text = build_dispatch_notice_text(incident, responded_at)
+        logger.info("首次可前往，發送出動通知：%s", incident["id"])
+
+        # 1) 原始通報員工（私訊）。失敗只記錄，不影響群組通知。
+        initiator = incident.get("initiator")
+        if initiator:
+            try:
+                line_bot_api.push_message(initiator, TextSendMessage(text=text))
+            except Exception as error:
+                logger.error("出動通知私訊原始通報者失敗：事件 %s；%s", incident["id"], error)
+
+        # 2) 所有次要通知群組。
+        failed = []
+        try:
+            targets = secondary_group_ids_for(incident_group_id)
+            failed = _push_text_to_groups(targets, text, "出動通知", incident["id"])
+        except Exception:
+            logger.exception("讀取次要通知群組失敗：%s", incident["id"])
+        if failed:
+            alert_admin("⚠️【出動通知發送失敗】\n"
+                        f"事件編號：{incident['id']}\n"
+                        f"失敗群組 ID：{'、'.join(failed)}\n"
+                        "主要救護群組及事件不受影響。")
+    except Exception:
+        logger.exception("出動通知處理失敗（不影響救護回應）：%s", incident.get("id"))
 
 
 def get_employee(user_id):
@@ -1487,7 +2099,10 @@ def confirm_employee_report(event, user_id, action, token_value):
         return
     active_incidents[group_id] = incident
     schedule_incident_timer(group_id, incident)
-    if push_emergency_notice(group_id, notice, incident_id):
+    primary_ok = push_emergency_notice(group_id, notice, incident_id)
+    # 同一事件（同一事件編號、同一地點）同步通知所有次要通知群組；失敗不影響主要群組及員工回覆。
+    broadcast_initial_notice_to_secondary(incident, group_id)
+    if primary_ok:
         reply_text(token, f"✅ 已通知救護群組。\n事件編號：{incident_id}\n事故地點：{item['location']}")
     else:
         reply_text(token, f"⚠️ 事件 {incident_id} 已建立，但群組通知發送失敗（可能是訊息額度已用完）。\n"
@@ -1555,15 +2170,18 @@ def handle_employee_dm(event, user_id, cmd, text):
 
 def is_admin_dm_command(cmd):
     return (cmd in ("管理選單", "查詢目前事件", "結束救護事件", "系統狀態", "待核准名單", "員工名單", "通報群組")
-            or cmd.startswith(("查詢救護事件 ", "停用員工 ")))
+            or cmd.startswith(("查詢救護事件 ", "停用員工 ", "通報群組 ")))
 
 
 def handle_dm_postback(event, user_id):
-    """私訊中的按鈕：管理者核准或拒絕員工申請。"""
+    """私訊中的按鈕：員工通報確認、管理者核准／拒絕員工申請、管理者設定通報群組。"""
     data = parse_qs(getattr(event.postback, "data", ""))
     action = data.get("action", [""])[0]
     if action in ("employee_report_confirm", "employee_report_reenter", "employee_report_cancel"):
         confirm_employee_report(event, user_id, action, data.get("token", [""])[0])
+        return
+    if action == "group_cfg":
+        handle_group_cfg_postback(event, user_id, data)
         return
     if action != "emp_review":
         return
@@ -1598,14 +2216,42 @@ def handle_dm_postback(event, user_id):
 # ============================================================
 # Webhook 事件處理（同步；於背景執行緒依序執行）
 # ============================================================
+def handle_group_join(group_id):
+    """入群處理：只在背景收錄並私訊最高管理者，絕不在群組內發送任何訊息。
+    重新入群時不覆蓋既有角色；只有仍是「未設定」的群組才會再私訊設定卡片。"""
+    try:
+        record_group(group_id, get_group_name(group_id))
+        with _known_groups_lock:
+            _known_groups[group_id] = time.monotonic()
+        row = get_notify_group(group_id)
+    except Exception:
+        logger.exception("新加入群組收錄失敗：%s", group_id)
+        forget_known_group(group_id)
+        return
+    if not row or row["role"] != GROUP_ROLE_UNASSIGNED:
+        return
+    try:
+        line_bot_api.push_message(ADMIN_USER_ID, new_group_card_message(row))
+    except Exception as error:
+        # 管理者收不到卡片（例如當月訊息額度用完）時，群組仍已收錄，可用「通報群組」查看並設定。
+        logger.error("新群組設定卡片私訊最高管理者失敗：%s；%s", group_id, error)
+
+
 def handle_event(event):
     group_id = get_group_id(event)
     source_type = getattr(getattr(event, "source", None), "type", None)
     user_id = get_user_id(event)
 
+    # 機器人被拉進群組：群組內完全靜音（不發面板、不發任何訊息）；
+    # 背景收錄為「未設定群組」，並私訊最高管理者一張設定卡片。
     if isinstance(event, JoinEvent) and group_id:
-        line_bot_api.reply_message(event.reply_token, panel_message())
+        handle_group_join(group_id)
         return
+
+    # 既有群組背景補錄：任何來自群組的事件（離開事件除外）都確認該群組已收錄。
+    # 命中記憶體快取時零成本；實際查詢與寫入在背景執行緒，不拖慢救護流程，群組內不產生任何訊息。
+    if group_id and not isinstance(event, LeaveEvent):
+        schedule_group_backfill(group_id)
 
     # 員工加機器人為好友：回覆使用說明（Reply 不耗額度）。
     if isinstance(event, FollowEvent) and source_type == "user":
@@ -1654,11 +2300,12 @@ def handle_event(event):
                     reply_text(event.reply_token,
                                f"已停用：{disabled['name']}（工號 {disabled['emp_no']}），該員工將無法再通報。" if disabled
                                else "查無此工號的已核准員工。")
-                elif cmd == "通報群組":
-                    current_group = get_rescue_group_id()
-                    reply_text(event.reply_token,
-                               f"目前救護通報群組：{current_group}" if current_group
-                               else "尚未設定通報群組。請管理者在要接收通知的群組輸入「設定通報群組」。")
+                elif cmd == "通報群組" or cmd.startswith("通報群組 "):
+                    match = re.fullmatch(r"通報群組(?:\s+(\d+))?", cmd)
+                    if not match:
+                        reply_text(event.reply_token, "格式：「通報群組」或「通報群組 頁碼」（例如：通報群組 2）。")
+                    else:
+                        reply_group_list(event.reply_token, int(match.group(1) or 1))
                 elif cmd == "管理選單":
                     reply_text(event.reply_token, build_admin_menu())
                 elif cmd == "查詢目前事件":
@@ -1700,27 +2347,8 @@ def handle_event(event):
                 reply_text(event.reply_token, "本機器人僅接受指定群組救護流程；管理功能僅限最高管理者私訊操作。")
             return
 
-        # 管理者在群組輸入管理指令，一律不執行。
-        if is_admin(user_id) and (
-            cmd in ("管理選單", "查詢目前事件", "系統狀態")
-            or cmd.startswith("查詢救護事件 ")
-            or cmd in ("人員管理", "查詢人員名單", "啟動護理人員登記", "關閉護理人員登記",
-                       "啟動工安人員登記", "關閉工安人員登記", "重設護理人員名單", "重設工安人員名單")
-        ):
-            reply_text(event.reply_token, "⛔ 最高管理者管理指令僅能在與救護機器人的一對一私訊中執行。")
-            return
-
-        # 在群組輸入「設定通報群組」：把本群組設為員工私訊通報的推播目標（僅最高管理者）。
-        if group_id and cmd == "設定通報群組":
-            if not is_admin(user_id):
-                reply_text(event.reply_token, "⛔ 僅最高管理者可以設定通報群組。")
-            else:
-                set_config("rescue_group_id", group_id)
-                note = ""
-                if RESCUE_GROUP_ID_ENV and RESCUE_GROUP_ID_ENV != group_id:
-                    note = "\n⚠️ 注意：Render 已設定環境變數 RESCUE_GROUP_ID 且與本群組不同，實際仍以環境變數為準。"
-                reply_text(event.reply_token, "✅ 已將本群組設為救護通報群組，員工私訊通報時會通知本群組。" + note)
-            return
+        # 群組內沒有任何管理指令或警告：管理類字眼（含「通報群組」「設定主要救護群組」等）
+        # 一律視為一般聊天訊息，機器人完全不回應。
 
     if not group_id:
         return
@@ -1729,6 +2357,9 @@ def handle_event(event):
     # 群組回應按鈕：任何成員可回應，並可隨時修改
     # ----------------------------------------------------
     if isinstance(event, PostbackEvent):
+        # 次要通知群組與未設定群組嚴格封鎖：不可操作、不回應。
+        if not is_primary_group(group_id):
+            return
         data = parse_qs(getattr(event.postback, "data", ""))
         action = data.get("action", [""])[0]
         incident_id = data.get("incident_id", [""])[0]
@@ -1770,16 +2401,21 @@ def handle_event(event):
                         line_bot_api.push_message(group_id, notice_message)
                     except Exception as error:
                         logger.error("可前往群組通知失敗：%s", error)
+
+            # 【多群組新增】首次有人回報「可前往」：通知原始通報員工及所有次要通知群組。
+            # 以資料庫一次性認領保證同一事件只通知一次；任何失敗都不影響上方原有回應流程。
+            if status == "available":
+                notify_dispatch_once(incident, group_id, user_id, timestamp)
             return
 
         if action == "start_emergency":
+            # 舊面板按鈕（面板已不再發送，但歷史訊息中的按鈕仍可能被點到）。
             start_emergency_flow(event.reply_token, group_id, user_id,
-                                 "目前已有啟動流程正在等待事故地點。")
+                                 "目前已有啟動流程正在等待事故地點。", reply_when_blocked=False)
             return
 
-        # 停用舊版護理/工安登記及結束確認按鈕。
+        # 停用舊版護理/工安登記及結束確認按鈕：群組內零痕跡，直接忽略。
         if action.startswith(("admin_", "register_", "ack_nurse_", "ack_safety_", "confirm_close", "cancel_close")):
-            reply_text(event.reply_token, "此為舊版功能按鈕，已停用。請使用最新救護事件流程。")
             return
 
         if action == "cancel_start":
@@ -1839,6 +2475,11 @@ def handle_event(event):
             return
 
     if not is_text:
+        return
+
+    # 救護運作指令只限主要救護群組；次要通知群組與未設定群組一律靜默。
+    # （119 例外：由 start_emergency_flow 回覆一句簡短提示，避免緊急時毫無反應。）
+    if cmd in ("結束救護事件", "救護回報", "回報狀況", "修改事故地點") and not is_primary_group(group_id):
         return
 
     # 結束目前群組的救護事件：僅最高管理者或該事件啟動者可操作。
@@ -1951,6 +2592,9 @@ def handle_event(event):
         schedule_incident_timer(group_id, incident)
         notice = "🚨 緊急救護通知，請回報支援狀況。"
         reply_emergency_notice(event.reply_token, notice, incident_id, group_id)
+        # 主要救護群組內啟動的事件，同步通知次要通知群組（可由 NOTIFY_SECONDARY_ON_GROUP_START 關閉）。
+        if NOTIFY_SECONDARY_ON_GROUP_START:
+            broadcast_initial_notice_to_secondary(incident, group_id)
         return
 
 
