@@ -1604,13 +1604,12 @@ def build_secondary_initial_text(incident):
     )
 
 
-def build_dispatch_notice_text(incident, responded_at):
+def build_dispatch_notice_text(incident, responder_name, responded_at):
     return (
-        "【緊急救護人員出動通知】\n\n"
-        "原通報事件已有救護人員回應，已出動前往現場。\n\n"
-        f"事件編號：{incident['id']}\n"
+        "🚑【緊急救護人員出動通知】\n\n"
+        "原始通報事件已有救護人員回應，已出動前往現場。\n\n"
         f"事故地點：{incident['location']}\n"
-        "救護狀態：已有人員前往處理\n"
+        f"救護人員：{safe_notice_text(responder_name or '未知')}\n"
         f"回應時間：{time_text(responded_at)}"
     )
 
@@ -1670,8 +1669,11 @@ def notify_dispatch_once(incident, incident_group_id, responder_id, responded_at
             return
         if not claimed:
             return
-        text = build_dispatch_notice_text(incident, responded_at)
-        logger.info("首次可前往，發送出動通知：%s", incident["id"])
+        responder_record = incident.get("responses", {}).get(responder_id, {})
+        responder_name = responder_record.get("display_name") or "未知"
+        text = build_dispatch_notice_text(incident, responder_name, responded_at)
+        logger.info("首次可前往，發送出動通知：%s；救護人員：%s",
+                    incident["id"], responder_name)
 
         # 1) 原始通報員工（私訊）。失敗只記錄，不影響群組通知。
         initiator = incident.get("initiator")
@@ -1951,11 +1953,23 @@ def handle_application_step(token, user_id, emp, step, cmd, text):
                               "資料正確請回覆「確認」送出申請，要中止請回覆「取消」。")
 
 
+def build_primary_emergency_notice(incident):
+    """群組啟動及員工私訊啟動共用的正式救護通知文字。"""
+    reporter = safe_notice_text(incident.get("initiator_name") or "未知")
+    location = safe_notice_text(incident.get("location") or "未提供")
+    return (
+        "🚨 緊急救護通知，請回報支援狀況。\n"
+        f"通報人：{reporter}\n"
+        f"事故地點：{location}"
+    )
+
+
 def _employee_report_notice(emp, location):
     reporter = f"{emp['name']}（工號 {emp['emp_no']}／分機 {emp['ext']}）"
-    notice = ("🚨 緊急救護通知，請回報支援狀況。\n"
-              f"通報人：{safe_notice_text(reporter)}\n"
-              f"事故地點：{safe_notice_text(location)}")
+    notice = build_primary_emergency_notice({
+        "initiator_name": reporter,
+        "location": location,
+    })
     return reporter, notice
 
 
@@ -2103,7 +2117,11 @@ def confirm_employee_report(event, user_id, action, token_value):
     # 同一事件（同一事件編號、同一地點）同步通知所有次要通知群組；失敗不影響主要群組及員工回覆。
     broadcast_initial_notice_to_secondary(incident, group_id)
     if primary_ok:
-        reply_text(token, f"✅ 已通知救護群組。\n事件編號：{incident_id}\n事故地點：{item['location']}")
+        reply_text(
+            token,
+            f"✅ 已通知救護群組。\n事故地點：{item['location']}\n\n"
+            "請留意現場狀況，並於安全可行的情況下，協助引導救護人員抵達事故地點。"
+        )
     else:
         reply_text(token, f"⚠️ 事件 {incident_id} 已建立，但群組通知發送失敗（可能是訊息額度已用完）。\n"
                           "請立即撥打緊急電話 8119 通知！")
@@ -2590,7 +2608,7 @@ def handle_event(event):
 
         active_incidents[group_id] = incident
         schedule_incident_timer(group_id, incident)
-        notice = "🚨 緊急救護通知，請回報支援狀況。"
+        notice = build_primary_emergency_notice(incident)
         reply_emergency_notice(event.reply_token, notice, incident_id, group_id)
         # 主要救護群組內啟動的事件，同步通知次要通知群組（可由 NOTIFY_SECONDARY_ON_GROUP_START 關閉）。
         if NOTIFY_SECONDARY_ON_GROUP_START:
